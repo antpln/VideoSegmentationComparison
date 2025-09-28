@@ -106,6 +106,18 @@ def _maybe_compile_edgetam_predictor(
                     compiled.model = inner_compiled
 
 
+def _verify_predictor_interfaces(predictor: object) -> None:
+    """Ensure the required SAM2 video APIs are available."""
+    required = ("init_state", "add_new_points_or_box", "propagate_in_video")
+    missing = [name for name in required if not hasattr(predictor, name)]
+    if missing:
+        raise AttributeError(
+            "EdgeTAM/SAM2 build is missing video tracking APIs: "
+            + ", ".join(missing)
+            + ". Update the dependency to a version that exposes video propagation."
+        )
+
+
 def run_with_points(
     frames_24fps: List[Path],
     prompt_frame_idx: int,
@@ -142,6 +154,7 @@ def run_with_points(
         }
 
     predictor = _init_predictor(weight_name)
+    _verify_predictor_interfaces(predictor)
     # Torch.compile can provide a modest boost on supported environments.
     _maybe_compile_edgetam_predictor(
         predictor,
@@ -180,8 +193,13 @@ def run_with_points(
         sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frame_paths)
         # Propagate the annotations through the video and collect logits.
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            if mask_logits:
-                mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
+            if mask_logits is None:
+                continue
+            logits = mask_logits[0] if isinstance(mask_logits, (list, tuple)) else mask_logits
+            if logits is None:
+                continue
+            mask = (logits > 0.0).cpu().numpy().astype(bool)
+            if 0 <= frame_idx < len(sub_masks):
                 sub_masks[frame_idx] = mask
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
@@ -256,6 +274,7 @@ def run_with_bbox(
         }
 
     predictor = _init_predictor(weight_name)
+    _verify_predictor_interfaces(predictor)
     _maybe_compile_edgetam_predictor(
         predictor,
         compile_model=compile_model,
@@ -280,8 +299,13 @@ def run_with_bbox(
         predictor.add_new_points_or_box(inference_state=inference_state, frame_idx=0, obj_id=1, box=np.array(bbox, dtype=np.float32))
         sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frames)
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            if mask_logits:
-                mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
+            if mask_logits is None:
+                continue
+            logits = mask_logits[0] if isinstance(mask_logits, (list, tuple)) else mask_logits
+            if logits is None:
+                continue
+            mask = (logits > 0.0).cpu().numpy().astype(bool)
+            if 0 <= frame_idx < len(sub_masks):
                 sub_masks[frame_idx] = mask
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
