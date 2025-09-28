@@ -1,0 +1,3 @@
+[submodule "EdgeTAM"]
+	path = EdgeTAM
+	url = https://github.com/facebookresearch/EdgeTAM.git
