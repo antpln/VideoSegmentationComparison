@@ -59,17 +59,10 @@ def _init_predictor(weight_name: str) -> object:
         raise ImportError("EdgeTAM is not installed")
 
     config_candidates = [
-        "~/cs8813/EdgeTAM/sam2/configs/edgetam.yaml",
         "./EdgeTAM/sam2/configs/edgetam.yaml",
-        "EdgeTAM/sam2/configs/edgetam.yaml",
-        "sam2/configs/edgetam.yaml",
     ]
     checkpoint_candidates = [
-        "~/cs8813/EdgeTAM/checkpoints/edgetam.pt",
         "./EdgeTAM/checkpoints/edgetam.pt",
-        "EdgeTAM/checkpoints/edgetam.pt",
-        "../EdgeTAM/checkpoints/edgetam.pt",
-        "../checkpoints/edgetam.pt",
         weight_name,
     ]
 
