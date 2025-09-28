@@ -59,22 +59,28 @@ def _init_predictor(weight_name: str) -> object:
         raise ImportError("EdgeTAM is not installed")
 
     config_candidates = [
-        "./EdgeTAM/sam2/configs/edgetam.yaml",
+        ("configs/edgetam.yaml", "./EdgeTAM/sam2/configs/edgetam.yaml"),
     ]
     checkpoint_candidates = [
         "./EdgeTAM/checkpoints/edgetam.pt",
         weight_name,
     ]
 
-    config_file = _find_existing(config_candidates)
+    config_name: Optional[str] = None
+    for hydra_name, disk_path in config_candidates:
+        resolved = Path(expand_path(disk_path))
+        if resolved.exists():
+            config_name = hydra_name
+            break
+
     checkpoint_path = _find_existing(checkpoint_candidates)
 
-    if config_file is None:
-        raise FileNotFoundError(f"EdgeTAM config not found among: {config_candidates}")
+    if config_name is None:
+        raise FileNotFoundError(f"EdgeTAM config not found among: {[p for _, p in config_candidates]}")
     if checkpoint_path is None:
         raise FileNotFoundError(f"EdgeTAM checkpoint not found among: {checkpoint_candidates}")
 
-    return build_sam2_video_predictor(config_file=str(config_file), ckpt_path=str(checkpoint_path))
+    return build_sam2_video_predictor(config_file=config_name, ckpt_path=str(checkpoint_path))
 
 
 def _maybe_compile_edgetam_predictor(
