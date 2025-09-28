@@ -46,9 +46,24 @@ def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], 
         if mask is None:
             overlays.append(frame)
             continue
-        if mask.shape != frame.shape[:2]:
-            mask = cv2.resize(mask.astype(np.uint8), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
-        overlays.append(overlay_union(frame, mask, alpha=0.5))
+        mask_arr = np.asarray(mask)
+        if mask_arr.size == 0:
+            overlays.append(frame)
+            continue
+        if mask_arr.ndim > 2:
+            mask_arr = np.any(mask_arr.astype(bool), axis=0)
+        else:
+            mask_arr = mask_arr.astype(bool)
+        if mask_arr.ndim != 2:
+            overlays.append(frame)
+            continue
+        if mask_arr.shape != frame.shape[:2]:
+            mask_arr = cv2.resize(
+                mask_arr.astype(np.uint8),
+                (frame.shape[1], frame.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        overlays.append(overlay_union(frame, mask_arr, alpha=0.5))
     write_video_mp4(output_path, overlays, fps)
     return str(output_path)
 
@@ -198,9 +213,26 @@ def run_with_points(
             logits = mask_logits[0] if isinstance(mask_logits, (list, tuple)) else mask_logits
             if logits is None:
                 continue
-            mask = (logits > 0.0).cpu().numpy().astype(bool)
+            if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
+                continue
+            if hasattr(logits, "detach"):
+                logits_np = logits.detach().cpu().numpy()
+            elif hasattr(logits, "cpu"):
+                logits_np = logits.cpu().numpy()
+            else:
+                logits_np = np.asarray(logits)
+            if logits_np.size == 0:
+                continue
+            mask_np = logits_np > 0.0
+            if mask_np.ndim > 2:
+                mask_np = np.any(mask_np, axis=0)
+            if mask_np.ndim != 2:
+                continue
+            mask_np = mask_np.astype(bool)
+            if mask_np.size == 0:
+                continue
             if 0 <= frame_idx < len(sub_masks):
-                sub_masks[frame_idx] = mask
+                sub_masks[frame_idx] = mask_np
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
         sub_masks = [None] * len(sub_frame_paths)
@@ -304,9 +336,26 @@ def run_with_bbox(
             logits = mask_logits[0] if isinstance(mask_logits, (list, tuple)) else mask_logits
             if logits is None:
                 continue
-            mask = (logits > 0.0).cpu().numpy().astype(bool)
+            if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
+                continue
+            if hasattr(logits, "detach"):
+                logits_np = logits.detach().cpu().numpy()
+            elif hasattr(logits, "cpu"):
+                logits_np = logits.cpu().numpy()
+            else:
+                logits_np = np.asarray(logits)
+            if logits_np.size == 0:
+                continue
+            mask_np = logits_np > 0.0
+            if mask_np.ndim > 2:
+                mask_np = np.any(mask_np, axis=0)
+            if mask_np.ndim != 2:
+                continue
+            mask_np = mask_np.astype(bool)
+            if mask_np.size == 0:
+                continue
             if 0 <= frame_idx < len(sub_masks):
-                sub_masks[frame_idx] = mask
+                sub_masks[frame_idx] = mask_np
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
         sub_masks = [None] * len(sub_frames)

@@ -48,9 +48,24 @@ def _record_overlays(frames: List[np.ndarray], masks_seq: List[Optional[np.ndarr
         if mask is None:
             overlays.append(frame)
             continue
-        if mask.shape != frame.shape[:2]:
-            mask = cv2.resize(mask.astype(np.uint8), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
-        overlays.append(overlay_union(frame, mask, alpha=0.5))
+        mask_arr = np.asarray(mask)
+        if mask_arr.size == 0:
+            overlays.append(frame)
+            continue
+        if mask_arr.ndim > 2:
+            mask_arr = np.any(mask_arr.astype(bool), axis=0)
+        else:
+            mask_arr = mask_arr.astype(bool)
+        if mask_arr.ndim != 2:
+            overlays.append(frame)
+            continue
+        if mask_arr.shape != frame.shape[:2]:
+            mask_arr = cv2.resize(
+                mask_arr.astype(np.uint8),
+                (frame.shape[1], frame.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        overlays.append(overlay_union(frame, mask_arr, alpha=0.5))
     write_video_mp4(output_path, overlays, fps)
     return str(output_path)
 
