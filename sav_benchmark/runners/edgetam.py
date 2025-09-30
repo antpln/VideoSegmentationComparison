@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover - EdgeTAM optional
     build_sam2_video_predictor = None  # type: ignore
 
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
-from .registry import register_model_family
+from .base import Model
 from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_union, write_video_mp4
 
@@ -138,7 +138,7 @@ def _verify_predictor_interfaces(predictor: object) -> None:
         )
 
 
-def run_with_points(
+def _run_points(
     frames_24fps: List[Path],
     prompt_frame_idx: int,
     prompt_mask: np.ndarray,
@@ -324,7 +324,7 @@ def run_with_points(
     }
 
 
-def run_with_bbox(
+def _run_bbox(
     frames_24fps: List[Path],
     prompt_frame_idx: int,
     prompt_mask: np.ndarray,
@@ -485,9 +485,76 @@ def run_with_bbox(
     }
 
 
-EDGETAM_RUNNERS = {
-    "points": run_with_points,
-    "bbox": run_with_bbox,
-}
+class EdgeTAM(Model):
+    """Concrete runner that exposes EdgeTAM trackers via the standard prompts."""
 
-register_model_family("edgetam", EDGETAM_RUNNERS)
+    def __init__(self) -> None:
+        super().__init__("edgetam")
+
+    def run_points(
+        self,
+        frames_24fps: List[Path],
+        prompt_frame_idx: int,
+        prompt_mask: np.ndarray,
+        imgsz: int,
+        weight_name: str,
+        device: str,
+        out_dir: Optional[Path] = None,
+        overlay_name: Optional[str] = None,
+        clip_fps: float = 24.0,
+        num_points: int = 5,
+        *,
+        compile_model: bool = False,
+        compile_mode: str | None = "reduce-overhead",
+        compile_backend: str | None = None,
+    ) -> Dict[str, object]:
+        return _run_points(
+            frames_24fps,
+            prompt_frame_idx,
+            prompt_mask,
+            imgsz,
+            weight_name,
+            device,
+            out_dir=out_dir,
+            overlay_name=overlay_name,
+            clip_fps=clip_fps,
+            num_points=num_points,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+        )
+
+    def run_bbox(
+        self,
+        frames_24fps: List[Path],
+        prompt_frame_idx: int,
+        prompt_mask: np.ndarray,
+        imgsz: int,
+        weight_name: str,
+        device: str,
+        out_dir: Optional[Path] = None,
+        overlay_name: Optional[str] = None,
+        clip_fps: float = 24.0,
+        *,
+        compile_model: bool = False,
+        compile_mode: str | None = "reduce-overhead",
+        compile_backend: str | None = None,
+    ) -> Dict[str, object]:
+        return _run_bbox(
+            frames_24fps,
+            prompt_frame_idx,
+            prompt_mask,
+            imgsz,
+            weight_name,
+            device,
+            out_dir=out_dir,
+            overlay_name=overlay_name,
+            clip_fps=clip_fps,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+        )
+
+
+EDGETAM_MODEL = EdgeTAM()
+EDGETAM_RUNNERS = EDGETAM_MODEL.register()

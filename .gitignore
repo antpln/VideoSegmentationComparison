@@ -1,3 +1,6 @@
 *.pt
 *.pyc
 /SA-V
+test_outputs/
+test_synthetic_data/
+**/__pycache__/

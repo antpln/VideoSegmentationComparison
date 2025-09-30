@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - ultralytics optional
     SAM2VideoPredictor = None  # type: ignore
 
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
-from .registry import register_model_family
+from .base import Model
 from ..utils import cuda_sync, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_union, write_video_mp4
 
@@ -111,7 +111,7 @@ def _maybe_compile_predictor_model(
 
 
 
-def run_with_points(
+def _run_points(
     frames_24fps: List[Path],
     prompt_frame_idx: int,
     prompt_mask: np.ndarray,
@@ -291,7 +291,7 @@ def run_with_points(
     }
 
 
-def run_with_bbox(
+def _run_bbox(
     frames_24fps: List[Path],
     prompt_frame_idx: int,
     prompt_mask: np.ndarray,
@@ -449,7 +449,7 @@ def run_with_bbox(
     fps = len(sub_frames) / duration
 
     return {
-    "secs": duration,
+        "secs": duration,
         "fps": fps,
         "latency_ms": 1000.0 / fps,
         "gpu_peak_alloc": gpu_alloc,
@@ -461,14 +461,83 @@ def run_with_bbox(
         "H": height,
         "W": width,
         "bbox": bbox,
-    "setup_ms": round(setup_secs * 1000.0, 2),
+        "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
 
-SAM2_RUNNERS = {
-    "points": run_with_points,
-    "bbox": run_with_bbox,
-}
+class SAM2(Model):
+    """Concrete runner for Ultralytics SAM2 video models.
 
-# Register on import so main pipeline can discover it generically.
-register_model_family("sam2", SAM2_RUNNERS)
+    The heavy lifting lives in `_run_points` / `_run_bbox` above. This wrapper
+    simply binds those helpers as bound methods so the registry can expose them
+    through the abstract base class.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("sam2")
+
+    def run_points(
+        self,
+        frames_24fps: List[Path],
+        prompt_frame_idx: int,
+        prompt_mask: np.ndarray,
+        imgsz: int,
+        weight_name: str,
+        device: str,
+        out_dir: Optional[Path] = None,
+        overlay_name: Optional[str] = None,
+        clip_fps: float = 24.0,
+        *,
+        compile_model: bool = False,
+        compile_mode: str | None = "reduce-overhead",
+        compile_backend: str | None = None,
+    ) -> Dict[str, object]:
+        return _run_points(
+            frames_24fps,
+            prompt_frame_idx,
+            prompt_mask,
+            imgsz,
+            weight_name,
+            device,
+            out_dir=out_dir,
+            overlay_name=overlay_name,
+            clip_fps=clip_fps,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+        )
+
+    def run_bbox(
+        self,
+        frames_24fps: List[Path],
+        prompt_frame_idx: int,
+        prompt_mask: np.ndarray,
+        imgsz: int,
+        weight_name: str,
+        device: str,
+        out_dir: Optional[Path] = None,
+        overlay_name: Optional[str] = None,
+        clip_fps: float = 24.0,
+        *,
+        compile_model: bool = False,
+        compile_mode: str | None = "reduce-overhead",
+        compile_backend: str | None = None,
+    ) -> Dict[str, object]:
+        return _run_bbox(
+            frames_24fps,
+            prompt_frame_idx,
+            prompt_mask,
+            imgsz,
+            weight_name,
+            device,
+            out_dir=out_dir,
+            overlay_name=overlay_name,
+            clip_fps=clip_fps,
+            compile_model=compile_model,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+        )
+
+
+SAM2_MODEL = SAM2()
+SAM2_RUNNERS = SAM2_MODEL.register()

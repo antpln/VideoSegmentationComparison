@@ -2,6 +2,11 @@
 
 Minimal tooling to compare SAM2 and EdgeTAM video segmentation pipelines. Supported prompts are limited to points and bounding boxes for both model families.
 
+Runners are wired through a light abstraction in `sav_benchmark/runners/base.py`. Each
+model family now subclasses `Model` (see `SAM2` and `EdgeTAM`) and registers its
+supported prompts on import, so adding a new runner only requires overriding the
+relevant prompt methods.
+
 
 ## Benchmark against a dataset
 
