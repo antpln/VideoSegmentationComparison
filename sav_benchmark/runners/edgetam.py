@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover - EdgeTAM optional
     build_sam2_video_predictor = None  # type: ignore
 
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
+from .registry import register_model_family
 from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_union, write_video_mp4
 
@@ -57,6 +58,10 @@ def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], 
         if mask_arr.ndim != 2:
             overlays.append(frame)
             continue
+        # Handle potential transposed (H,W) mismatch (e.g., logits came as (W,H)).
+        if mask_arr.shape[0] == frame.shape[1] and mask_arr.shape[1] == frame.shape[0]:
+            # Transpose to match frame (H,W)
+            mask_arr = mask_arr.T
         if mask_arr.shape != frame.shape[:2]:
             mask_arr = cv2.resize(
                 mask_arr.astype(np.uint8),
@@ -151,7 +156,8 @@ def run_with_points(
 ) -> Dict[str, object]:
     _ = (imgsz, device)
     # Translate the mask into positive point prompts.
-    points, labels = extract_points_from_mask(prompt_mask, num_points)
+    # Use a single positive point for fair comparison with SAM2 point prompting.
+    points, labels = extract_points_from_mask(prompt_mask, 1)
     if not points:
         return {
             "secs": None,
@@ -168,21 +174,28 @@ def run_with_points(
             "num_points": 0,
         }
 
+    # Fairness alignment with SAM2: start GPU peak tracking BEFORE predictor build
+    # and separate setup (predictor build + clip write + init_state + prompt seeding)
+    # from pure propagation inference time.
+    process = psutil.Process()
+    reset_gpu_peaks()
+    cpu_peak = process.memory_info().rss
+    setup_start = time.perf_counter()
+
     predictor = _init_predictor(weight_name)
     _verify_predictor_interfaces(predictor)
-    # Torch.compile can provide a modest boost on supported environments.
     _maybe_compile_edgetam_predictor(
         predictor,
         compile_model=compile_model,
         compile_mode=compile_mode,
         compile_backend=compile_backend,
     )
+
     # Focus only on frames from the prompting timestep forward.
     sub_frame_paths = frames_24fps[prompt_frame_idx:]
     first_frame = _read_frame(sub_frame_paths[0])
     height, width = first_frame.shape[:2]
 
-    # EdgeTAM consumes contiguous mp4 clips.
     temp_video = Path(out_dir) / f"__tmp_edgetam_points_{overlay_name or 'clip'}.mp4" if out_dir else Path("__tmp_edgetam_points.mp4")
     writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"avc1"), clip_fps, (width, height))
     if not writer.isOpened():  # pragma: no cover
@@ -194,23 +207,30 @@ def run_with_points(
     finally:
         writer.release()
 
-    process = psutil.Process()
-    reset_gpu_peaks()
-    cpu_peak = process.memory_info().rss
-    start = time.perf_counter()
+    inference_start: float | None = None
 
     try:
         inference_state = predictor.init_state(str(temp_video))
         points_np = np.array(points, dtype=np.float32)
         labels_np = np.array(labels, dtype=np.int32)
-        predictor.add_new_points_or_box(inference_state=inference_state, frame_idx=0, obj_id=1, points=points_np, labels=labels_np)
+        predictor.add_new_points_or_box(
+            inference_state=inference_state, frame_idx=0, obj_id=1, points=points_np, labels=labels_np
+        )
+        # Start pure inference timing AFTER seeding (parity with SAM2 logic)
+        inference_start = time.perf_counter()
 
         sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frame_paths)
-        # Propagate the annotations through the video and collect logits.
+        mask_logits_count = 0
+        positive_logits_count = 0
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            if mask_logits is None:
+            if mask_logits is None or 1 not in obj_ids:
                 continue
-            logits = mask_logits[0] if isinstance(mask_logits, (list, tuple)) else mask_logits
+            mask_logits_count += 1
+            if isinstance(mask_logits, (list, tuple)):
+                idx = obj_ids.index(1)
+                logits = mask_logits[idx]
+            else:
+                logits = mask_logits
             if logits is None:
                 continue
             if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
@@ -223,26 +243,50 @@ def run_with_points(
                 logits_np = np.asarray(logits)
             if logits_np.size == 0:
                 continue
-            mask_np = logits_np > 0.0
-            if mask_np.ndim > 2:
-                mask_np = np.any(mask_np, axis=0)
+            if mask_logits_count <= 5:
+                print(
+                    f"[DEBUG EdgeTAM logits] frame={frame_idx} shape={logits_np.shape} min={float(logits_np.min()):.4f} max={float(logits_np.max()):.4f}"
+                )
+            if np.count_nonzero(logits_np) > 0:
+                positive_logits_count += 1
+            tmp = logits_np
+            thr = 0.5 if (tmp.min() >= 0.0 and tmp.max() <= 1.0) else 0.0
+            mask_np = tmp > thr
+            while mask_np.ndim > 2:
+                if mask_np.shape[0] == 1:
+                    mask_np = mask_np[0]
+                else:
+                    mask_np = np.any(mask_np, axis=0)
             if mask_np.ndim != 2:
                 continue
             mask_np = mask_np.astype(bool)
-            if mask_np.size == 0:
+            if mask_np.size == 0 or not mask_np.any():
                 continue
             if 0 <= frame_idx < len(sub_masks):
                 sub_masks[frame_idx] = mask_np
+        print(
+            f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks)}"
+        )
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
         sub_masks = [None] * len(sub_frame_paths)
+        if inference_start is None:
+            inference_start = time.perf_counter()
 
     cuda_sync()
-    duration = max(1e-9, time.perf_counter() - start)
+    if inference_start is None:
+        inference_start = time.perf_counter()
+    duration = max(1e-9, time.perf_counter() - inference_start)
+    setup_secs = inference_start - setup_start
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
     masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
+
+    # Debug: log mask statistics
+    valid_masks = sum(1 for m in masks_seq if m is not None)
+    total_frames = len(masks_seq)
+    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_frames} frames have masks")
 
     overlay_path = None
     if out_dir and overlay_name:
@@ -269,7 +313,8 @@ def run_with_points(
         "frames": len(frames_24fps),
         "H": height,
         "W": width,
-        "num_points": len(points),
+    "num_points": len(points),  # will be 1 under the single-point policy
+        "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
 
@@ -305,6 +350,12 @@ def run_with_bbox(
             "W": 0,
         }
 
+    # Align fairness: track GPU peaks from predictor build; separate setup vs inference.
+    process = psutil.Process()
+    reset_gpu_peaks()
+    cpu_peak = process.memory_info().rss
+    setup_start = time.perf_counter()
+
     predictor = _init_predictor(weight_name)
     _verify_predictor_interfaces(predictor)
     _maybe_compile_edgetam_predictor(
@@ -313,27 +364,42 @@ def run_with_bbox(
         compile_mode=compile_mode,
         compile_backend=compile_backend,
     )
-    frames = [_read_frame(path) for path in frames_24fps]
-    sub_frames = frames[prompt_frame_idx:]
-    height, width = sub_frames[0].shape[:2]
 
-    # Prepare a contiguous mp4 clip for the predictor.
+    sub_frame_paths = frames_24fps[prompt_frame_idx:]
+    first_frame = _read_frame(sub_frame_paths[0])
+    height, width = first_frame.shape[:2]
+
     temp_video = Path(out_dir) / f"__tmp_edgetam_bbox_{overlay_name or 'clip'}.mp4" if out_dir else Path("__tmp_edgetam_bbox.mp4")
-    write_video_mp4(temp_video, sub_frames, clip_fps)
+    writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"avc1"), clip_fps, (width, height))
+    if not writer.isOpened():  # pragma: no cover
+        raise RuntimeError(f"Could not open video writer for {temp_video}")
+    try:
+        for frame_path in sub_frame_paths:
+            frame = _read_frame(frame_path)
+            writer.write(frame)
+    finally:
+        writer.release()
 
-    process = psutil.Process()
-    reset_gpu_peaks()
-    cpu_peak = process.memory_info().rss
-    start = time.perf_counter()
+    inference_start: float | None = None
 
     try:
         inference_state = predictor.init_state(str(temp_video))
-        predictor.add_new_points_or_box(inference_state=inference_state, frame_idx=0, obj_id=1, box=np.array(bbox, dtype=np.float32))
-        sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frames)
+        predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=0,
+            obj_id=1,
+            box=np.array(bbox, dtype=np.float32),
+        )
+        inference_start = time.perf_counter()
+        sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frame_paths)
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            if mask_logits is None:
+            if mask_logits is None or 1 not in obj_ids:
                 continue
-            logits = mask_logits[0] if isinstance(mask_logits, (list, tuple)) else mask_logits
+            if isinstance(mask_logits, (list, tuple)):
+                idx = obj_ids.index(1)
+                logits = mask_logits[idx]
+            else:
+                logits = mask_logits
             if logits is None:
                 continue
             if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
@@ -354,31 +420,40 @@ def run_with_bbox(
             mask_np = mask_np.astype(bool)
             if mask_np.size == 0:
                 continue
-            if 0 <= frame_idx < len(sub_masks):
-                sub_masks[frame_idx] = mask_np
+            sub_masks[frame_idx] = mask_np
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
-        sub_masks = [None] * len(sub_frames)
+        sub_masks = [None] * len(sub_frame_paths)
+        if inference_start is None:
+            inference_start = time.perf_counter()
 
     cuda_sync()
-    duration = max(1e-9, time.perf_counter() - start)
+    if inference_start is None:
+        inference_start = time.perf_counter()
+    duration = max(1e-9, time.perf_counter() - inference_start)
+    setup_secs = inference_start - setup_start
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
     masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
 
+    # Debug: log mask statistics
+    valid_masks = sum(1 for m in masks_seq if m is not None)
+    total_frames = len(masks_seq)
+    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_frames} frames have masks")
+
     overlay_path = None
     if out_dir and overlay_name:
         # Persist overlays only on demand.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
-        _record_overlays([Path(p) for p in frames_24fps], masks_seq, overlay_path, clip_fps)
+        _record_overlays(frames_24fps, masks_seq, overlay_path, clip_fps)
 
     try:
         temp_video.unlink(missing_ok=True)
     except OSError:
         pass
 
-    fps = len(sub_frames) / duration
+    fps = len(sub_frame_paths) / duration
 
     return {
         "secs": duration,
@@ -393,6 +468,7 @@ def run_with_bbox(
         "H": height,
         "W": width,
         "bbox": bbox,
+        "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
 
@@ -400,3 +476,5 @@ EDGETAM_RUNNERS = {
     "points": run_with_points,
     "bbox": run_with_bbox,
 }
+
+register_model_family("edgetam", EDGETAM_RUNNERS)

@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - ultralytics optional
     SAM2VideoPredictor = None  # type: ignore
 
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
+from .registry import register_model_family
 from ..utils import cuda_sync, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_union, write_video_mp4
 
@@ -125,8 +126,8 @@ def run_with_points(
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
 ) -> Dict[str, object]:
-    # Derive positive prompts directly from the supplied mask.
-    points, labels = extract_points_from_mask(prompt_mask, num_points=5)
+    # Derive a SINGLE positive prompt point from the supplied mask (fairness across models).
+    points, labels = extract_points_from_mask(prompt_mask, num_points=1)
     if not points:
         return {
             "secs": None,
@@ -157,7 +158,7 @@ def run_with_points(
     process = psutil.Process()
     reset_gpu_peaks()
     cpu_peak = process.memory_info().rss
-    start = time.perf_counter()
+    setup_start = time.perf_counter()
 
     # Configure the predictor for video tracking on the chosen weights.
     overrides = {
@@ -171,6 +172,7 @@ def run_with_points(
     }
 
     sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frames)
+    inference_start: float | None = None
     try:
         predictor = _sam2_predictor(overrides)
         # Optionally wrap the underlying module in torch.compile.
@@ -198,6 +200,8 @@ def run_with_points(
                 points=points_np,
                 labels=labels_np,
             )
+            # Start timing AFTER predictor build, init_state, and prompt seeding.
+            inference_start = time.perf_counter()
 
             # Collect masks produced for each propagated frame.
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
@@ -219,6 +223,7 @@ def run_with_points(
                     continue
             if iterator is None:
                 raise TypeError("SAM2VideoPredictor streaming interface not supported by this build")
+            inference_start = time.perf_counter()
 
             for idx, result in enumerate(iterator):
                 mask = _result_to_mask(result)
@@ -229,7 +234,10 @@ def run_with_points(
         sub_masks = [None] * len(sub_frames)
 
     cuda_sync()
-    duration = max(1e-9, time.perf_counter() - start)
+    if inference_start is None:  # If failure before timing began, treat inference time as 0.
+        inference_start = time.perf_counter()
+    duration = max(1e-9, time.perf_counter() - inference_start)
+    setup_secs = inference_start - setup_start
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
@@ -248,7 +256,7 @@ def run_with_points(
 
     fps = len(sub_frames) / duration
     return {
-        "secs": duration,
+    "secs": duration,
         "fps": fps,
         "latency_ms": 1000.0 / fps,
         "gpu_peak_alloc": gpu_alloc,
@@ -260,6 +268,7 @@ def run_with_points(
         "H": height,
         "W": width,
         "num_points": len(points),
+    "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
 
@@ -307,7 +316,7 @@ def run_with_bbox(
     process = psutil.Process()
     reset_gpu_peaks()
     cpu_peak = process.memory_info().rss
-    start = time.perf_counter()
+    setup_start = time.perf_counter()
 
     overrides = {
         "conf": 0.25,
@@ -320,6 +329,7 @@ def run_with_bbox(
     }
 
     sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frames)
+    inference_start: float | None = None
     try:
         predictor = _sam2_predictor(overrides)
         _maybe_compile_predictor_model(
@@ -344,6 +354,7 @@ def run_with_bbox(
                 obj_id=1,
                 box=bbox_np,
             )
+            inference_start = time.perf_counter()
 
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 if mask_logits is not None and len(mask_logits) > 0:
@@ -366,6 +377,7 @@ def run_with_bbox(
                     continue
             if iterator is None:
                 raise TypeError("SAM2VideoPredictor streaming bbox interface not supported by this build")
+            inference_start = time.perf_counter()
 
             for idx, result in enumerate(iterator):
                 mask = _result_to_mask(result)
@@ -376,7 +388,10 @@ def run_with_bbox(
         sub_masks = [None] * len(sub_frames)
 
     cuda_sync()
-    duration = max(1e-9, time.perf_counter() - start)
+    if inference_start is None:
+        inference_start = time.perf_counter()
+    duration = max(1e-9, time.perf_counter() - inference_start)
+    setup_secs = inference_start - setup_start
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
@@ -396,7 +411,7 @@ def run_with_bbox(
     fps = len(sub_frames) / duration
 
     return {
-        "secs": duration,
+    "secs": duration,
         "fps": fps,
         "latency_ms": 1000.0 / fps,
         "gpu_peak_alloc": gpu_alloc,
@@ -408,6 +423,7 @@ def run_with_bbox(
         "H": height,
         "W": width,
         "bbox": bbox,
+    "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
 
@@ -415,3 +431,6 @@ SAM2_RUNNERS = {
     "points": run_with_points,
     "bbox": run_with_bbox,
 }
+
+# Register on import so main pipeline can discover it generically.
+register_model_family("sam2", SAM2_RUNNERS)

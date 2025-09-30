@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -13,8 +14,9 @@ import numpy as np
 from .data_io import ensure_dir, list_annotated_indices_6fps, list_frames_24fps, load_mask_png, read_video_ids
 from .metrics import j_and_proxy_jf
 from .prompts import mask_centroid
-from .runners.edgetam import EDGETAM_RUNNERS
-from .runners.sam2 import SAM2_RUNNERS
+from .runners import edgetam  # noqa: F401  (ensure registration side-effects)
+from .runners import sam2  # noqa: F401
+from .runners.registry import get_runner
 from .synthetic import create_synthetic_test_data
 from .utils import device_str, to_mib
 
@@ -61,6 +63,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="reduce-overhead",
         help="torch.compile mode (e.g., default, reduce-overhead, max-autotune)",
     )
+    parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
     return parser.parse_args(args=argv)
 
 
@@ -88,20 +92,19 @@ def _resolve_models(model_tags: List[str], weights_dir: Path) -> List[Tuple[str,
 
 
 def _select_runner(tag: str):
-    """Return the appropriate runner callable for the provided model tag."""
     if "_" not in tag:
         raise ValueError(f"Malformed model tag: {tag}")
     parts = tag.split("_")
     prompt_type = parts[-1]
-    model_name = "_".join(parts[:-1])
-
-    if model_name.startswith("sam2_"):
-        runner = SAM2_RUNNERS.get(prompt_type)
-    elif model_name == "edgetam":
-        runner = EDGETAM_RUNNERS.get(prompt_type)
+    model_root = "_".join(parts[:-1])
+    # Derive family name (strip size suffixes for sam2 family)
+    if model_root.startswith("sam2"):
+        family = "sam2"
+    elif model_root == "edgetam":
+        family = "edgetam"
     else:
-        runner = None
-
+        family = model_root
+    runner = get_runner(family, prompt_type)
     if runner is None:
         raise ValueError(f"Unsupported model/prompt combination: {tag}")
     return runner
@@ -154,6 +157,13 @@ def run(args: argparse.Namespace) -> Path:
     device = device_str()
 
     video_ids = read_video_ids(split_dir, args.split_name)
+    # Apply optional deterministic or random shuffling.
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        args.shuffle_videos = True  # seed implies shuffle
+    if args.shuffle_videos:
+        random.shuffle(video_ids)
     if args.limit_videos > 0:
         video_ids = video_ids[: args.limit_videos]
     print(f"Found {len(video_ids)} videos.")
@@ -234,23 +244,25 @@ def run(args: argparse.Namespace) -> Path:
 
                 j_score, jf_proxy = j_and_proxy_jf(predicted_masks, gt_masks)
 
-                summary_rows.append(
-                    {
-                        "video": video_id,
-                        "object": obj_id,
-                        "model": tag,
-                        "imgsz": args.imgsz,
-                        "frames": result.get("frames"),
-                        "fps": None if result.get("fps") is None else round(result["fps"], 2),
-                        "latency_ms": None if result.get("latency_ms") is None else round(result["latency_ms"], 1),
-                        "gpu_peak_alloc_MiB": to_mib(result.get("gpu_peak_alloc")),
-                        "gpu_peak_reserved_MiB": to_mib(result.get("gpu_peak_reserved")),
-                        "cpu_peak_rss_MiB": to_mib(result.get("cpu_peak_rss")),
-                        "J": None if j_score is None else round(j_score, 4),
-                        "JandF_proxy": None if jf_proxy is None else round(jf_proxy, 4),
-                        "overlay": result.get("overlay"),
-                    }
-                )
+                row = {
+                    "video": video_id,
+                    "object": obj_id,
+                    "model": tag,
+                    "imgsz": args.imgsz,
+                    "frames": result.get("frames"),
+                    "fps": None if result.get("fps") is None else round(result["fps"], 2),
+                    "latency_ms": None if result.get("latency_ms") is None else round(result["latency_ms"], 1),
+                    "gpu_peak_alloc_MiB": to_mib(result.get("gpu_peak_alloc")),
+                    "gpu_peak_reserved_MiB": to_mib(result.get("gpu_peak_reserved")),
+                    "cpu_peak_rss_MiB": to_mib(result.get("cpu_peak_rss")),
+                    "J": None if j_score is None else round(j_score, 4),
+                    "JandF_proxy": None if jf_proxy is None else round(jf_proxy, 4),
+                    "overlay": result.get("overlay"),
+                }
+                # Include setup time if provided by runner (e.g., SAM2 separation of build vs inference)
+                if "setup_ms" in result:
+                    row["setup_ms"] = result["setup_ms"]
+                summary_rows.append(row)
                 print(
                     f"    -> FPS {summary_rows[-1]['fps']}, J {summary_rows[-1]['J']}, "
                     f"mem GPU alloc {summary_rows[-1]['gpu_peak_alloc_MiB']} MiB"
