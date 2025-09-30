@@ -207,6 +207,14 @@ def run_with_points(
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 if mask_logits is not None and len(mask_logits) > 0:
                     mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
+                    if mask.ndim > 2:
+                        mask = np.any(mask, axis=0)
+                    if mask.shape != (height, width):
+                        mask = cv2.resize(
+                            mask.astype(np.uint8),
+                            (width, height),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
                     if 0 <= frame_idx < len(sub_masks):
                         sub_masks[frame_idx] = mask
         else:
@@ -227,6 +235,17 @@ def run_with_points(
 
             for idx, result in enumerate(iterator):
                 mask = _result_to_mask(result)
+                if mask is not None:
+                    if mask.ndim > 2:
+                        mask = np.any(mask.astype(bool), axis=0)
+                    else:
+                        mask = mask.astype(bool)
+                    if mask.shape != (height, width):
+                        mask = cv2.resize(
+                            mask.astype(np.uint8),
+                            (width, height),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
                 if mask is not None and idx < len(sub_masks):
                     sub_masks[idx] = mask
     except Exception as exc:  # pragma: no cover
@@ -359,6 +378,14 @@ def run_with_bbox(
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 if mask_logits is not None and len(mask_logits) > 0:
                     mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
+                    if mask.ndim > 2:
+                        mask = np.any(mask, axis=0)
+                    if mask.shape != (height, width):
+                        mask = cv2.resize(
+                            mask.astype(np.uint8),
+                            (width, height),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
                     if 0 <= frame_idx < len(sub_masks):
                         sub_masks[frame_idx] = mask
         else:
@@ -381,6 +408,17 @@ def run_with_bbox(
 
             for idx, result in enumerate(iterator):
                 mask = _result_to_mask(result)
+                if mask is not None:
+                    if mask.ndim > 2:
+                        mask = np.any(mask.astype(bool), axis=0)
+                    else:
+                        mask = mask.astype(bool)
+                    if mask.shape != (height, width):
+                        mask = cv2.resize(
+                            mask.astype(np.uint8),
+                            (width, height),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
                 if mask is not None and idx < len(sub_masks):
                     sub_masks[idx] = mask
     except Exception as exc:  # pragma: no cover

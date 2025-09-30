@@ -18,11 +18,15 @@ def j_and_proxy_jf(pred_seq_masks: Iterable[Optional[np.ndarray]], gt_seq_masks:
     """Return the mean Jaccard score and a proxy J&F value for a sequence."""
     scores: List[float] = []
     for pred, gt in zip(pred_seq_masks, gt_seq_masks):
-        if pred is None or gt is None:
+        if gt is None:
+            continue
+        if pred is None:
+            scores.append(0.0)
             continue
         if pred.ndim == 3:
             # Collapse multi-channel predictions to a single binary mask.
             pred = np.any(pred.astype(bool), axis=0)
+        pred = pred.astype(bool)
         scores.append(iou_binary(pred, gt))
     if not scores:
         return None, None

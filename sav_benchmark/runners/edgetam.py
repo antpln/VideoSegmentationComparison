@@ -260,8 +260,14 @@ def run_with_points(
             if mask_np.ndim != 2:
                 continue
             mask_np = mask_np.astype(bool)
-            if mask_np.size == 0 or not mask_np.any():
+            if mask_np.size == 0:
                 continue
+            if mask_np.shape != (height, width):
+                mask_np = cv2.resize(
+                    mask_np.astype(np.uint8),
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
             if 0 <= frame_idx < len(sub_masks):
                 sub_masks[frame_idx] = mask_np
         print(
@@ -420,7 +426,14 @@ def run_with_bbox(
             mask_np = mask_np.astype(bool)
             if mask_np.size == 0:
                 continue
-            sub_masks[frame_idx] = mask_np
+            if mask_np.shape != (height, width):
+                mask_np = cv2.resize(
+                    mask_np.astype(np.uint8),
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            if 0 <= frame_idx < len(sub_masks):
+                sub_masks[frame_idx] = mask_np
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
         sub_masks = [None] * len(sub_frame_paths)
