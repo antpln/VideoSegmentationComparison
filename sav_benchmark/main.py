@@ -21,6 +21,11 @@ from .synthetic import create_synthetic_test_data
 from .utils import device_str, to_mib
 
 try:
+    from ultralytics.hub.utils import check_file
+except ImportError:
+    check_file = None
+
+try:
     import torch  # type: ignore[import]
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
@@ -134,6 +139,15 @@ def _resolve_models(args: argparse.Namespace, model_tags: List[str], weights_dir
     for tag in model_tags:
         weight_file = model_map.get(tag)
         if weight_file:
+            is_sam2 = tag.startswith("sam2")
+            if is_sam2 and check_file:
+                try:
+                    # Download if missing. check_file returns the resolved path.
+                    weight_file = check_file(weight_file)
+                except Exception as e:
+                    print(f"[WARN] Failed to download weights for {tag}: {e}")
+                    continue
+
             candidates = _candidate_weight_paths(weight_file, weights_dir)
             if not candidates:
                 print(
