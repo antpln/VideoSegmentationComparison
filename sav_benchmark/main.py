@@ -7,7 +7,7 @@ import csv
 import sys
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -36,6 +36,8 @@ SAM2_WEIGHTS = {
 EDGETAM_WEIGHTS = {
     "edgetam": "edgetam.pt",
 }
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -68,7 +70,55 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args=argv)
 
 
-def _resolve_models(model_tags: List[str], weights_dir: Path) -> List[Tuple[str, str]]:
+def _unique_existing(paths: Iterable[Path]) -> List[Path]:
+    seen: Set[Path] = set()
+    result: List[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(path)
+    return result
+
+
+def _candidate_weight_paths(source: str, weights_dir: Path) -> List[Path]:
+    source_path = Path(source)
+
+    if source_path.is_absolute():
+        return _unique_existing([source_path])
+
+    search_roots = []
+    for root in (weights_dir, REPO_ROOT, REPO_ROOT / "EdgeTAM"):
+        if root.exists() and root.is_dir():
+            search_roots.append(root)
+
+    candidates: List[Path] = []
+
+    # Direct joins (respecting any sub-directories in the relative path)
+    for base in search_roots:
+        candidates.append(base / source_path)
+
+    # Fallback: search by filename under each root (similar to `find | grep`)
+    filename = source_path.name
+    visited: Set[Path] = set()
+    for base in search_roots:
+        try:
+            for match in base.rglob(filename):
+                if match not in visited:
+                    candidates.append(match)
+                    visited.add(match)
+        except (OSError, PermissionError):
+            continue
+    found = _unique_existing(candidates)
+    for path in found:
+        print(f"  [INFO] Found weights: {path}")
+    return found
+
+
+def _resolve_models(args: argparse.Namespace, model_tags: List[str], weights_dir: Path) -> List[Tuple[str, str]]:
     """Map model tags to weight paths if available on disk."""
     model_map: Dict[str, str] = {}
 
@@ -83,11 +133,17 @@ def _resolve_models(model_tags: List[str], weights_dir: Path) -> List[Tuple[str,
     resolved: List[Tuple[str, str]] = []
     for tag in model_tags:
         weight_file = model_map.get(tag)
-        if not weight_file:
-            print(f"[WARN] Unknown model tag: {tag} (skipping)")
+        if weight_file:
+            candidates = _candidate_weight_paths(weight_file, weights_dir)
+            if not candidates:
+                print(
+                    f"[WARN] Could not locate weights for {tag}: searched for '{weight_file}' under {weights_dir}"
+                )
+                continue
+            resolved.append((tag, str(candidates[0])))
             continue
-        weight_path = weights_dir / weight_file
-        resolved.append((tag, str(weight_path) if weight_path.exists() else weight_file))
+
+        print(f"[WARN] Unknown model tag: {tag} (skipping)")
     return resolved
 
 
@@ -149,7 +205,7 @@ def run(args: argparse.Namespace) -> Path:
     split_dir, out_dir = _prepare_dataset(args)
     weights_dir = Path(args.weights_dir)
     model_tags = [tag.strip() for tag in args.models.split(",") if tag.strip()]
-    models = _resolve_models(model_tags, weights_dir)
+    models = _resolve_models(args, model_tags, weights_dir)
     if not models:
         raise SystemExit("No valid models selected")
 

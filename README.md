@@ -7,6 +7,30 @@ model family now subclasses `Model` (see `SAM2` and `EdgeTAM`) and registers its
 supported prompts on import, so adding a new runner only requires overriding the
 relevant prompt methods.
 
+For edge deployments prefer TorchScript/JIT exports through Ultralytics’ built-in
+exporters when running the SAM2 family. EdgeTAM remains a PyTorch-only tracker and
+cannot be traced directly.
+
+To produce a TorchScript artifact for SAM2 via Ultralytics:
+
+```bash
+python - <<'PY'
+from ultralytics.models.sam import SAM2VideoPredictor
+predictor = SAM2VideoPredictor(overrides={
+    'model': 'sam2.1_b.pt',
+    'task': 'track',
+    'mode': 'predict',
+    'imgsz': 1024,
+    'device': 'cuda',
+    'save': False,
+})
+predictor.export(format='torchscript', imgsz=1024, dynamic=True, out='sam2.1_b.torchscript.pt')
+PY
+```
+
+The resulting `*.torchscript.pt` file can be deployed on edge hardware that
+supports TorchScript runtimes.
+
 
 ## Benchmark against a dataset
 
