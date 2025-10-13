@@ -4,3 +4,6 @@
 test_outputs/
 test_synthetic_data/
 **/__pycache__/
+*.jpg
+*.jpeg
+*.png

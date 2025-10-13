@@ -6,6 +6,7 @@ import argparse
 import csv
 import sys
 import random
+import gc
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -337,6 +338,13 @@ def run(args: argparse.Namespace) -> Path:
                     f"    -> FPS {summary_rows[-1]['fps']}, J {summary_rows[-1]['J']}, "
                     f"mem GPU alloc {summary_rows[-1]['gpu_peak_alloc_MiB']} MiB"
                 )
+
+                # Free memory before next model run
+                del runner
+                del result
+                gc.collect()
+                if torch and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         if summary_rows:
             # Overwrite the CSV on each iteration so progress survives interruptions.
