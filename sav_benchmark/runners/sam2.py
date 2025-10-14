@@ -269,8 +269,11 @@ def _run_points(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    # Convert sub_masks dict to list for output (None for missing)
-    sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frames))]
+    # Convert sub_masks dict or list to list for output (None for missing)
+    if isinstance(sub_masks, dict):
+        sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frames))]
+    else:
+        sub_masks_list = [sub_masks[i] if i < len(sub_masks) else None for i in range(len(sub_frames))]
     masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
     overlay_path = None
