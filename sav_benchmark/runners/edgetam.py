@@ -153,6 +153,7 @@ def _run_points(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
+    max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     _ = (imgsz, device)
     # Translate the mask into positive point prompts.
@@ -219,9 +220,9 @@ def _run_points(
         # Start pure inference timing AFTER seeding (parity with SAM2 logic)
         inference_start = time.perf_counter()
 
-        sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frame_paths)
-        mask_logits_count = 0
-        positive_logits_count = 0
+        # Replace sub_masks with a dict for sliding window
+        sub_masks: Dict[int, Optional[np.ndarray]] = {}
+        mask_indices: List[int] = []
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
             if mask_logits is None or 1 not in obj_ids:
                 continue
@@ -268,10 +269,19 @@ def _run_points(
                     (width, height),
                     interpolation=cv2.INTER_NEAREST,
                 ).astype(bool)
-            if 0 <= frame_idx < len(sub_masks):
+            if 0 <= frame_idx < len(sub_frame_paths):
                 sub_masks[frame_idx] = mask_np
+                mask_indices.append(frame_idx)
+                # Remove oldest if exceeding max_frames_in_mem
+                if len(mask_indices) > max_frames_in_mem:
+                    oldest = mask_indices.pop(0)
+                    del sub_masks[oldest]
+        # Convert sub_masks dict to list for output (None for missing)
+        sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frame_paths))]
+        masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
+
         print(
-            f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks)}"
+            f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks_list)}"
         )
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
@@ -338,6 +348,7 @@ def _run_bbox(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
+    max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     _ = (imgsz, device)
     bbox = extract_bbox_from_mask(prompt_mask)
@@ -434,6 +445,10 @@ def _run_bbox(
                 ).astype(bool)
             if 0 <= frame_idx < len(sub_masks):
                 sub_masks[frame_idx] = mask_np
+                # Remove oldest if exceeding max_frames_in_mem
+                if len(sub_masks) > max_frames_in_mem:
+                    oldest = next(iter(sub_masks))  # Get the first added (oldest) frame
+                    del sub_masks[oldest]
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
         sub_masks = [None] * len(sub_frame_paths)

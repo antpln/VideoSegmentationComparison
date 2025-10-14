@@ -121,10 +121,12 @@ def _run_points(
     out_dir: Optional[Path] = None,
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
+    num_points: int = 5,
     *,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
+    max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     # Derive a SINGLE positive prompt point from the supplied mask (fairness across models).
     points, labels = extract_points_from_mask(prompt_mask, num_points=1)
@@ -171,7 +173,9 @@ def _run_points(
         "device": device,
     }
 
-    sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frames)
+    # Replace sub_masks with a dict for sliding window
+    sub_masks: Dict[int, Optional[np.ndarray]] = {}
+    mask_indices: List[int] = []
     inference_start: float | None = None
     try:
         predictor = _sam2_predictor(overrides)
@@ -217,6 +221,11 @@ def _run_points(
                         ).astype(bool)
                     if 0 <= frame_idx < len(sub_masks):
                         sub_masks[frame_idx] = mask
+                        mask_indices.append(frame_idx)
+                        # Remove oldest if exceeding max_frames_in_mem
+                        if len(mask_indices) > max_frames_in_mem:
+                            oldest = mask_indices.pop(0)
+                            del sub_masks[oldest]
         else:
             # Fallback for newer Ultralytics builds that only expose the streaming API.
             iterator = None
@@ -260,7 +269,9 @@ def _run_points(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
+    # Convert sub_masks dict to list for output (None for missing)
+    sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frames))]
+    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
     overlay_path = None
     if out_dir and overlay_name:
@@ -305,6 +316,7 @@ def _run_bbox(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
+    max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     bbox = extract_bbox_from_mask(prompt_mask)
     if bbox is None:
@@ -347,7 +359,9 @@ def _run_bbox(
         "device": device,
     }
 
-    sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frames)
+    # Replace sub_masks with a dict for sliding window
+    sub_masks: Dict[int, Optional[np.ndarray]] = {}
+    mask_indices: List[int] = []
     inference_start: float | None = None
     try:
         predictor = _sam2_predictor(overrides)
@@ -388,6 +402,11 @@ def _run_bbox(
                         ).astype(bool)
                     if 0 <= frame_idx < len(sub_masks):
                         sub_masks[frame_idx] = mask
+                        mask_indices.append(frame_idx)
+                        # Remove oldest if exceeding max_frames_in_mem
+                        if len(mask_indices) > max_frames_in_mem:
+                            oldest = mask_indices.pop(0)
+                            del sub_masks[oldest]
         else:
             # Fallback for predictor builds exposing only the streaming interface.
             iterator = None
