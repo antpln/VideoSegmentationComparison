@@ -73,7 +73,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
-    parser.add_argument("--max_frames_in_mem", type=int, default=3, help="Maximum number of previous frames/masks to keep in memory during inference.")
+    parser.add_argument("--max_frames_in_mem", type=int, default=600, help="Maximum number of previous frames/masks to keep in memory during inference.")
     return parser.parse_args(args=argv)
 
 
