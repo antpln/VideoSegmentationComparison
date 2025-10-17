@@ -7,6 +7,7 @@ import csv
 import sys
 import random
 import gc
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -291,20 +292,40 @@ def run(args: argparse.Namespace) -> Path:
 
                 print(f"  Model {tag} | obj {obj_id} | prompt frame {prompt_idx}")
                 # Execute the selected runner and collect per-object telemetry.
-                result = runner(
-                    frames_24fps=frames,
-                    prompt_frame_idx=prompt_idx,
-                    prompt_mask=prompt_mask,
-                    imgsz=args.imgsz,
-                    weight_name=weight_name,
-                    device=device,
-                    out_dir=out_dir if args.save_overlays else None,
-                    overlay_name=overlay_name,
-                    clip_fps=24.0,
-                    compile_model=args.compile_models,
-                    compile_mode=args.compile_mode,
-                    compile_backend=args.compile_backend,
-                )
+                if torch and torch.cuda.is_available():
+                    amp_module = getattr(torch.cuda, "amp", None)
+                    if amp_module and hasattr(amp_module, "autocast"):
+                        dtype = torch.float16
+                        bf16_supported = False
+                        checker = getattr(torch.cuda, "is_bf16_supported", None)
+                        if callable(checker):
+                            try:
+                                bf16_supported = bool(checker())
+                            except Exception:
+                                bf16_supported = False
+                        if bf16_supported:
+                            dtype = torch.bfloat16
+                        autocast_cm = amp_module.autocast(dtype=dtype, enabled=True)
+                    else:
+                        autocast_cm = nullcontext()
+                else:
+                    autocast_cm = nullcontext()
+
+                with autocast_cm:
+                    result = runner(
+                        frames_24fps=frames,
+                        prompt_frame_idx=prompt_idx,
+                        prompt_mask=prompt_mask,
+                        imgsz=args.imgsz,
+                        weight_name=weight_name,
+                        device=device,
+                        out_dir=out_dir if args.save_overlays else None,
+                        overlay_name=overlay_name,
+                        clip_fps=24.0,
+                        compile_model=args.compile_models,
+                        compile_mode=args.compile_mode,
+                        compile_backend=args.compile_backend,
+                    )
 
                 predicted_masks: List[Optional[np.ndarray]] = []
                 if result.get("masks_seq") is None:
