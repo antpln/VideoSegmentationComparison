@@ -317,6 +317,19 @@ def _run_points(
         temp_video.unlink(missing_ok=True)
     except OSError:
         pass
+    
+    # Explicit cleanup to prevent GPU memory accumulation
+    # EdgeTAM creates a fresh predictor for each call, so we must clean up
+    try:
+        del predictor
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
     fps = len(sub_frame_paths) / duration
 
@@ -482,6 +495,19 @@ def _run_bbox(
     try:
         temp_video.unlink(missing_ok=True)
     except OSError:
+        pass
+    
+    # Explicit cleanup to prevent GPU memory accumulation
+    # EdgeTAM creates a fresh predictor for each call, so we must clean up
+    try:
+        del predictor
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
         pass
 
     fps = len(sub_frame_paths) / duration

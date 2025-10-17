@@ -55,9 +55,9 @@ def parse_args() -> argparse.Namespace:
                         help="Skip setup phase (use existing preprocessed data)")
     parser.add_argument("--skip_inference", action="store_true",
                         help="Only run setup phase")
-    parser.add_argument("--autocast_dtype", type=str, default="float16",
+    parser.add_argument("--autocast_dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"],
-                        help="Dtype for autocast (enables flash attention with fp16/bfloat16; default=float16 for Jetson Orin compatibility)")
+                        help="Dtype for autocast (enables flash attention with fp16/bfloat16; default=bfloat16)")
     
     return parser.parse_args()
 
@@ -638,16 +638,41 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
                     f"mem GPU alloc {row['gpu_peak_alloc_MiB']} MiB"
                 )
                 
-                # Cleanup between models
+                # Aggressive cleanup between models to prevent OOM
                 del runner, result
+                if 'predicted_masks' in locals():
+                    del predicted_masks
+                if 'mask_sequence' in locals():
+                    del mask_sequence
                 gc.collect()
                 try:
                     import torch
                     if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                         torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
                 except ImportError:
                     pass
+            
+            # Additional cleanup between objects
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
         
+        # Cleanup between videos
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
         # Save progress after each video
         if summary_rows:
             fieldnames = list(summary_rows[0].keys())
