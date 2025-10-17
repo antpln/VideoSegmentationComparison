@@ -55,9 +55,9 @@ def parse_args() -> argparse.Namespace:
                         help="Skip setup phase (use existing preprocessed data)")
     parser.add_argument("--skip_inference", action="store_true",
                         help="Only run setup phase")
-    parser.add_argument("--autocast_dtype", type=str, default="bfloat16",
+    parser.add_argument("--autocast_dtype", type=str, default="float16",
                         choices=["float32", "float16", "bfloat16"],
-                        help="Dtype for autocast (enables flash attention with fp16/bfloat16)")
+                        help="Dtype for autocast (enables flash attention with fp16/bfloat16; default=float16 for Jetson Orin compatibility)")
     
     return parser.parse_args()
 
@@ -584,7 +584,6 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
                             overlay_name=overlay_name,
                             clip_fps=24.0,
                             compile_model=False,  # Already warmed up
-                            max_frames_in_mem=args.max_frames_in_mem,
                         )
                 else:
                     result = runner(
@@ -598,7 +597,6 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
                         overlay_name=overlay_name,
                         clip_fps=24.0,
                         compile_model=False,  # Already warmed up
-                        max_frames_in_mem=args.max_frames_in_mem,
                     )
                 
                 # Evaluate predictions
