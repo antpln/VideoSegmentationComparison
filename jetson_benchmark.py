@@ -358,9 +358,22 @@ def warmup_models(args: argparse.Namespace, model_tags: List[str]):
 
                 filtered = {k: v for k, v in warmup_kwargs.items() if accepted is None or k in accepted}
 
+                # Determine autocast dtype for warmup
+                dtype_map = {
+                    "float32": torch.float32,
+                    "float16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                }
+                autocast_dtype = dtype_map.get(args.autocast_dtype, torch.bfloat16)
+                use_autocast = args.autocast_dtype != "float32" and torch.cuda.is_available()
+
                 # Attempt 1: single-frame warmup (preferred)
                 try:
-                    result = runner(**filtered)
+                    if use_autocast:
+                        with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                            result = runner(**filtered)
+                    else:
+                        result = runner(**filtered)
                     
                     # Check if result is valid (has masks)
                     if isinstance(result, dict):

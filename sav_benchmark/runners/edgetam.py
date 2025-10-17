@@ -289,7 +289,8 @@ def _run_points(
         )
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
-        sub_masks = [None] * len(sub_frame_paths)
+        sub_masks_list = [None] * len(sub_frame_paths)
+        masks_seq = [None] * prompt_frame_idx + sub_masks_list
         if inference_start is None:
             inference_start = time.perf_counter()
 
@@ -300,8 +301,6 @@ def _run_points(
     setup_secs = inference_start - setup_start
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
-
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
 
     # Debug: log mask statistics
     valid_masks = sum(1 for m in masks_seq if m is not None)
