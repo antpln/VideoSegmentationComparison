@@ -209,6 +209,7 @@ def _run_points(
         writer.release()
 
     inference_start: float | None = None
+    sub_masks_list: List[Optional[np.ndarray]]
 
     try:
         inference_state = predictor.init_state(str(temp_video))
@@ -223,6 +224,8 @@ def _run_points(
         # Replace sub_masks with a dict for sliding window
         sub_masks: Dict[int, Optional[np.ndarray]] = {}
         mask_indices: List[int] = []
+        mask_logits_count = 0
+        positive_logits_count = 0
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
             if mask_logits is None or 1 not in obj_ids:
                 continue
@@ -278,14 +281,13 @@ def _run_points(
                     del sub_masks[oldest]
         # Convert sub_masks dict to list for output (None for missing)
         sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frame_paths))]
-        masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
         print(
             f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks_list)}"
         )
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
-        sub_masks = [None] * len(sub_frame_paths)
+        sub_masks_list = [None] * len(sub_frame_paths)
         if inference_start is None:
             inference_start = time.perf_counter()
 
@@ -297,7 +299,9 @@ def _run_points(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
+    if 'sub_masks_list' not in locals():
+        sub_masks_list = [None] * len(sub_frame_paths)
+    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
     # Debug: log mask statistics
     valid_masks = sum(1 for m in masks_seq if m is not None)
@@ -445,10 +449,6 @@ def _run_bbox(
                 ).astype(bool)
             if 0 <= frame_idx < len(sub_masks):
                 sub_masks[frame_idx] = mask_np
-                # Remove oldest if exceeding max_frames_in_mem
-                if len(sub_masks) > max_frames_in_mem:
-                    oldest = next(iter(sub_masks))  # Get the first added (oldest) frame
-                    del sub_masks[oldest]
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
         sub_masks = [None] * len(sub_frame_paths)

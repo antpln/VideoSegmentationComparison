@@ -6,7 +6,6 @@ import argparse
 import csv
 import sys
 import random
-import gc
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -20,11 +19,6 @@ from .runners import sam2  # noqa: F401
 from .runners.registry import get_runner
 from .synthetic import create_synthetic_test_data
 from .utils import device_str, to_mib
-
-try:
-    from ultralytics.hub.utils import check_file
-except ImportError:
-    check_file = None
 
 try:
     import torch  # type: ignore[import]
@@ -73,7 +67,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
-    parser.add_argument("--max_frames_in_mem", type=int, default=600, help="Maximum number of previous frames/masks to keep in memory during inference.")
     return parser.parse_args(args=argv)
 
 
@@ -141,15 +134,6 @@ def _resolve_models(args: argparse.Namespace, model_tags: List[str], weights_dir
     for tag in model_tags:
         weight_file = model_map.get(tag)
         if weight_file:
-            is_sam2 = tag.startswith("sam2")
-            if is_sam2 and check_file:
-                try:
-                    # Download if missing. check_file returns the resolved path.
-                    weight_file = check_file(weight_file)
-                except Exception as e:
-                    print(f"[WARN] Failed to download weights for {tag}: {e}")
-                    continue
-
             candidates = _candidate_weight_paths(weight_file, weights_dir)
             if not candidates:
                 print(
@@ -339,13 +323,6 @@ def run(args: argparse.Namespace) -> Path:
                     f"    -> FPS {summary_rows[-1]['fps']}, J {summary_rows[-1]['J']}, "
                     f"mem GPU alloc {summary_rows[-1]['gpu_peak_alloc_MiB']} MiB"
                 )
-
-                # Free memory before next model run
-                del runner
-                del result
-                gc.collect()
-                if torch and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
         if summary_rows:
             # Overwrite the CSV on each iteration so progress survives interruptions.
