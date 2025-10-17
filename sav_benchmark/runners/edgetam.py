@@ -108,7 +108,7 @@ def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], 
     return str(output_path)
 
 
-def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optional[int] = None) -> object:
+def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optional[int] = None, compile_image_encoder: bool = False) -> object:
     """Build an EdgeTAM video predictor using discovered config/weights.
 
     Honors the optional image_size to reduce memory footprint in a device-agnostic way.
@@ -159,6 +159,10 @@ def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optio
             f"++model.memory_attention.layer.cross_attention.q_sizes=[{q_size},{q_size}]",
             f"++model.memory_attention.layer.cross_attention.k_sizes=[{k_size},{k_size}]",
         ])
+    
+    # Optionally compile image encoder for speed (adds compile overhead on first run)
+    if compile_image_encoder:
+        hydra_overrides_extra.append("++model.compile_image_encoder=true")
 
     return build_sam2_video_predictor(
         config_file=config_name,
@@ -175,20 +179,20 @@ def _maybe_compile_edgetam_predictor(
     compile_mode: str | None,
     compile_backend: str | None,
 ) -> None:
-    """Optionally wrap EdgeTAM submodules in torch.compile for speed."""
+    """Note: EdgeTAM does not support full model compilation via torch.compile.
+    
+    Only the image encoder can be compiled via compile_image_encoder=True in the config.
+    Attempting to compile the full predictor (which has @torch.inference_mode() decorators)
+    will likely fail or provide no benefit.
+    
+    SAM 2 has vos_optimized=True flag for full compilation, but EdgeTAM doesn't support this.
+    """
     if not compile_model:
         return
-
-    for attr in ("model", "sam2"):
-        candidate = getattr(predictor, attr, None)
-        compiled, ok = maybe_compile_module(candidate, mode=compile_mode, backend=compile_backend)
-        if ok:
-            setattr(predictor, attr, compiled)
-            if attr == "sam2":
-                inner = getattr(compiled, "model", None)
-                inner_compiled, inner_ok = maybe_compile_module(inner, mode=compile_mode, backend=compile_backend)
-                if inner_ok:
-                    compiled.model = inner_compiled
+    
+    print("[WARN EdgeTAM] Full model compilation via --compile_models is not supported by EdgeTAM.")
+    print("[WARN EdgeTAM] Only image encoder compilation is supported (already enabled if --compile_models is set).")
+    print("[WARN EdgeTAM] Methods decorated with @torch.inference_mode() cannot be compiled.")
 
 
 def _verify_predictor_interfaces(predictor: object) -> None:
@@ -248,7 +252,7 @@ def _run_points(
     cpu_peak = process.memory_info().rss
     setup_start = time.perf_counter()
 
-    predictor = _init_predictor(weight_name, device=device, image_size=imgsz)
+    predictor = _init_predictor(weight_name, device=device, image_size=imgsz, compile_image_encoder=compile_model)
     _verify_predictor_interfaces(predictor)
     _maybe_compile_edgetam_predictor(
         predictor,
@@ -502,7 +506,7 @@ def _run_bbox(
     cpu_peak = process.memory_info().rss
     setup_start = time.perf_counter()
 
-    predictor = _init_predictor(weight_name, device=device, image_size=imgsz)
+    predictor = _init_predictor(weight_name, device=device, image_size=imgsz, compile_image_encoder=compile_model)
     _verify_predictor_interfaces(predictor)
     _maybe_compile_edgetam_predictor(
         predictor,
