@@ -55,6 +55,9 @@ def parse_args() -> argparse.Namespace:
                         help="Skip setup phase (use existing preprocessed data)")
     parser.add_argument("--skip_inference", action="store_true",
                         help="Only run setup phase")
+    parser.add_argument("--autocast_dtype", type=str, default="bfloat16",
+                        choices=["float32", "float16", "bfloat16"],
+                        help="Dtype for autocast (enables flash attention with fp16/bfloat16)")
     
     return parser.parse_args()
 
@@ -302,74 +305,107 @@ def warmup_models(args: argparse.Namespace, model_tags: List[str]):
     try:
         import torch
         import numpy as np
+        import inspect
         from pathlib import Path
-        
-        # Create a tiny dummy video for warmup
+        import shutil
+        import gc
+
+        # Create a tiny dummy frame for safe warmup
         warmup_dir = Path("./warmup_data")
         warmup_dir.mkdir(exist_ok=True)
-        
-        # Generate 10 dummy frames
-        dummy_frames = []
-        for i in range(10):
-            frame_path = warmup_dir / f"{i:05d}.jpg"
-            if not frame_path.exists():
-                import cv2
-                dummy_img = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
-                cv2.imwrite(str(frame_path), dummy_img)
-            dummy_frames.append(frame_path)
-        
-        # Dummy prompt mask
+        frame_path = warmup_dir / "00000.jpg"
+        if not frame_path.exists():
+            import cv2
+            img = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+            cv2.imwrite(str(frame_path), img)
+
+        dummy_frames = [frame_path]
         dummy_mask = np.zeros((256, 256), dtype=bool)
         dummy_mask[100:150, 100:150] = True
-        
+
         from sav_benchmark.main import _resolve_models, _select_runner
         from sav_benchmark.utils import device_str
-        
+
         weights_dir = Path(args.weights_dir)
         models = _resolve_models(args, model_tags, weights_dir)
         device = device_str()
-        
+
         for tag, weight_name in models:
             print(f"\n  Warming up {tag}...")
-            
             try:
                 runner = _select_runner(tag)
-                
-                # Prepare minimal kwargs for warmup
-                # Don't pass max_frames_in_mem - it's only used internally by runners
+
+                # Candidate warmup kwargs (single-frame / small)
                 warmup_kwargs = dict(
                     frames_24fps=dummy_frames,
                     prompt_frame_idx=0,
                     prompt_mask=dummy_mask,
-                    imgsz=256,  # Small size for warmup
+                    imgsz=256,
                     weight_name=weight_name,
                     device=device,
                     out_dir=None,
                     overlay_name=None,
                     clip_fps=24.0,
-                    compile_model=False,  # Don't compile in setup
+                    compile_model=False,
                 )
-                
-                # Run warmup with standard runner interface
-                result = runner(**warmup_kwargs)
-                
-                print(f"    ✓ Warmup complete")
-                
-                # Cleanup
+
+                # Inspect runner signature and filter kwargs to accepted params only
+                try:
+                    sig = inspect.signature(runner)
+                    accepted = set(sig.parameters.keys())
+                except Exception:
+                    accepted = None
+
+                filtered = {k: v for k, v in warmup_kwargs.items() if accepted is None or k in accepted}
+
+                # Attempt 1: single-frame warmup (preferred)
+                try:
+                    _ = runner(**filtered)
+                    print("    ✓ Warmup: single-frame run succeeded")
+                except Exception as e1:
+                    print(f"    ! single-frame warmup failed: {e1}")
+
+                    # Attempt 2: minimal load-only call (trigger model instantiation/weight load)
+                    minimal = {}
+                    if accepted:
+                        if "weight_name" in accepted:
+                            minimal["weight_name"] = weight_name
+                        if "device" in accepted:
+                            minimal["device"] = device
+                        if "compile_model" in accepted:
+                            minimal["compile_model"] = False
+
+                    if minimal:
+                        try:
+                            _ = runner(**minimal)
+                            print("    ✓ Warmup: minimal load-only succeeded")
+                        except Exception as e2:
+                            print(f"    ✗ Minimal load-only failed: {e2}; skipping warmup for this model")
+                    else:
+                        # Last-resort positional attempt
+                        try:
+                            _ = runner(weight_name)
+                            print("    ✓ Warmup: positional load-only succeeded")
+                        except Exception:
+                            try:
+                                _ = runner(weight_name, device)
+                                print("    ✓ Warmup: positional load-only (weight_name,device) succeeded")
+                            except Exception as e3:
+                                print(f"    ✗ All warmup attempts failed: {e3}; skipping warmup for this model")
+
+                # cleanup
                 del runner
-                del result
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    
+
             except Exception as e:
-                print(f"    ✗ Warmup failed: {e}")
+                print(f"    ✗ Warmup skipped/failed for {tag}: {e}")
                 continue
-        
-        # Cleanup warmup data
-        import shutil
+
+        # remove warmup files
         shutil.rmtree(warmup_dir, ignore_errors=True)
-        
+
     except Exception as e:
         print(f"Model warmup failed: {e}")
 
@@ -497,20 +533,49 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
                 if args.save_overlays:
                     overlay_name = f"{video_id}__obj{obj_id}__{tag}"
                 
-                # Run inference with clean environment
-                result = runner(
-                    frames_24fps=frames,
-                    prompt_frame_idx=prompt_idx,
-                    prompt_mask=prompt_mask,
-                    imgsz=args.imgsz,
-                    weight_name=weight_name,
-                    device=device,
-                    out_dir=out_dir if args.save_overlays else None,
-                    overlay_name=overlay_name,
-                    clip_fps=24.0,
-                    compile_model=False,  # Already warmed up
-                    max_frames_in_mem=args.max_frames_in_mem,
-                )
+                # Run inference with autocast for flash attention support
+                import torch
+                
+                # Determine autocast dtype
+                dtype_map = {
+                    "float32": torch.float32,
+                    "float16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                }
+                autocast_dtype = dtype_map.get(args.autocast_dtype, torch.bfloat16)
+                
+                # Use autocast if not float32 and CUDA is available
+                use_autocast = args.autocast_dtype != "float32" and torch.cuda.is_available()
+                
+                if use_autocast:
+                    with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
+                        result = runner(
+                            frames_24fps=frames,
+                            prompt_frame_idx=prompt_idx,
+                            prompt_mask=prompt_mask,
+                            imgsz=args.imgsz,
+                            weight_name=weight_name,
+                            device=device,
+                            out_dir=out_dir if args.save_overlays else None,
+                            overlay_name=overlay_name,
+                            clip_fps=24.0,
+                            compile_model=False,  # Already warmed up
+                            max_frames_in_mem=args.max_frames_in_mem,
+                        )
+                else:
+                    result = runner(
+                        frames_24fps=frames,
+                        prompt_frame_idx=prompt_idx,
+                        prompt_mask=prompt_mask,
+                        imgsz=args.imgsz,
+                        weight_name=weight_name,
+                        device=device,
+                        out_dir=out_dir if args.save_overlays else None,
+                        overlay_name=overlay_name,
+                        clip_fps=24.0,
+                        compile_model=False,  # Already warmed up
+                        max_frames_in_mem=args.max_frames_in_mem,
+                    )
                 
                 # Evaluate predictions
                 predicted_masks: List[Optional[np.ndarray]] = []
