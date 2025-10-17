@@ -11,6 +11,30 @@ except Exception:  # pragma: no cover - torch is optional
     torch = None
 
 
+def is_jetson() -> bool:
+    """Detect if running on Jetson platform (unified memory architecture)."""
+    # Check for Tegra SoC (Jetson identifier)
+    if os.path.exists("/etc/nv_tegra_release"):
+        return True
+    if os.path.exists("/sys/firmware/devicetree/base/model"):
+        try:
+            with open("/sys/firmware/devicetree/base/model", "r") as f:
+                model = f.read().lower()
+                if "jetson" in model or "tegra" in model:
+                    return True
+        except Exception:
+            pass
+    # Check CUDA device name for Tegra/Orin
+    if torch is not None and torch.cuda.is_available():
+        try:
+            device_name = torch.cuda.get_device_name(0).lower()
+            if "orin" in device_name or "xavier" in device_name or "tegra" in device_name:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def device_str() -> str:
     """Return the preferred device string for torch-based predictors."""
     if torch is None:
@@ -34,11 +58,53 @@ def reset_gpu_peaks() -> None:
 
 
 def get_gpu_peaks() -> Tuple[Optional[int], Optional[int]]:
-    """Return peak allocated and reserved memory in bytes when CUDA is active."""
+    """Return peak allocated and reserved memory in bytes when CUDA is active.
+    
+    Note: On Jetson (unified memory), this reports CUDA allocator's view of the 
+    shared memory pool. For total system memory, use psutil.memory_info().
+    """
     if torch is None or not torch.cuda.is_available():
         return None, None
     torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+
+
+def get_memory_info() -> dict:
+    """Get comprehensive memory information accounting for unified vs discrete architecture.
+    
+    Returns dict with keys:
+        - is_unified: bool, True for Jetson/unified memory
+        - gpu_alloc: int or None, CUDA allocated bytes
+        - gpu_reserved: int or None, CUDA reserved bytes  
+        - system_total: int or None, total system RAM
+        - system_used: int or None, used system RAM
+        - note: str, interpretation note for unified systems
+    """
+    import psutil
+    
+    unified = is_jetson()
+    gpu_alloc, gpu_reserved = get_gpu_peaks()
+    
+    # System memory
+    mem = psutil.virtual_memory()
+    sys_total = mem.total
+    sys_used = mem.used
+    
+    note = ""
+    if unified and gpu_alloc is not None:
+        note = (
+            "Unified memory: GPU and system share same physical RAM. "
+            "GPU alloc is subset of system used, not additive."
+        )
+    
+    return {
+        "is_unified": unified,
+        "gpu_alloc": gpu_alloc,
+        "gpu_reserved": gpu_reserved,
+        "system_total": sys_total,
+        "system_used": sys_used,
+        "note": note,
+    }
 
 
 def to_mib(value: Optional[int]) -> Optional[float]:
