@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--autocast_dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"],
                         help="Dtype for autocast (enables flash attention with fp16/bfloat16; default=bfloat16)")
+    parser.add_argument("--memory_log_interval", type=int, default=10,
+                        help="Log GPU/CPU memory every N frames during inference (0=disable)")
     
     return parser.parse_args()
 
@@ -502,6 +504,10 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
     
     print(f"\nLoaded metadata for {len(metadata['video_data'])} videos")
     
+    # Set memory logging interval for EdgeTAM via environment variable
+    import os
+    os.environ["EDGETAM_MEMORY_LOG_INTERVAL"] = str(args.memory_log_interval)
+    
     # Run benchmark using preprocessed data
     from sav_benchmark.main import _resolve_models, _select_runner
     from sav_benchmark.data_io import load_mask_png, ensure_dir
@@ -546,6 +552,16 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
             # Run each model
             for tag, weight_name in models:
                 print(f"  Model {tag} | obj {obj_id} | prompt frame {prompt_idx}")
+                
+                # Log memory before inference
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        gpu_before = torch.cuda.memory_allocated() / 1024**2
+                        gpu_reserved_before = torch.cuda.memory_reserved() / 1024**2
+                        print(f"    [PRE-INFERENCE] GPU alloc: {gpu_before:.1f} MiB, reserved: {gpu_reserved_before:.1f} MiB")
+                except ImportError:
+                    pass
                 
                 try:
                     runner = _select_runner(tag)
@@ -637,6 +653,16 @@ def run_inference_phase(args: argparse.Namespace, setup_config: Optional[Dict[st
                     f"    -> FPS {row['fps']}, J {row['J']}, "
                     f"mem GPU alloc {row['gpu_peak_alloc_MiB']} MiB"
                 )
+                
+                # Log memory after inference (before cleanup)
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        gpu_after = torch.cuda.memory_allocated() / 1024**2
+                        gpu_reserved_after = torch.cuda.memory_reserved() / 1024**2
+                        print(f"    [POST-INFERENCE] GPU alloc: {gpu_after:.1f} MiB, reserved: {gpu_reserved_after:.1f} MiB")
+                except ImportError:
+                    pass
                 
                 # Aggressive cleanup between models to prevent OOM
                 del runner, result

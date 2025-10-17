@@ -227,7 +227,35 @@ def _run_points(
         # Replace sub_masks with a dict for sliding window
         sub_masks: Dict[int, Optional[np.ndarray]] = {}
         mask_indices: List[int] = []
+        
+        # Memory tracking for debugging
+        try:
+            import torch
+            import os
+            track_memory = torch.cuda.is_available()
+            memory_log_interval = int(os.environ.get("EDGETAM_MEMORY_LOG_INTERVAL", "10"))
+        except (ImportError, ValueError):
+            track_memory = False
+            memory_log_interval = 0
+        
+        frame_count = 0
+        
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+            frame_count += 1
+            
+            # Periodic memory logging
+            if track_memory and memory_log_interval > 0 and frame_count % memory_log_interval == 0:
+                import torch
+                gpu_allocated = torch.cuda.memory_allocated() / 1024**2
+                gpu_reserved = torch.cuda.memory_reserved() / 1024**2
+                cpu_mem = process.memory_info().rss / 1024**2
+                print(
+                    f"[MEMORY] Frame {frame_idx}/{len(sub_frame_paths)} | "
+                    f"GPU alloc: {gpu_allocated:.1f} MiB, reserved: {gpu_reserved:.1f} MiB | "
+                    f"CPU: {cpu_mem:.1f} MiB | "
+                    f"Masks in mem: {len(mask_indices)}"
+                )
+            
             if mask_logits is None or 1 not in obj_ids:
                 continue
             mask_logits_count += 1
