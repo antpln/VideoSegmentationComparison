@@ -220,6 +220,10 @@ def _run_points(
         # Start pure inference timing AFTER seeding (parity with SAM2 logic)
         inference_start = time.perf_counter()
 
+        # Initialize counters for debugging
+        mask_logits_count = 0
+        positive_logits_count = 0
+        
         # Replace sub_masks with a dict for sliding window
         sub_masks: Dict[int, Optional[np.ndarray]] = {}
         mask_indices: List[int] = []

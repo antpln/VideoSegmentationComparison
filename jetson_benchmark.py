@@ -360,7 +360,18 @@ def warmup_models(args: argparse.Namespace, model_tags: List[str]):
 
                 # Attempt 1: single-frame warmup (preferred)
                 try:
-                    _ = runner(**filtered)
+                    result = runner(**filtered)
+                    
+                    # Check if result is valid (has masks)
+                    if isinstance(result, dict):
+                        masks_seq = result.get("masks_seq", [])
+                        valid_masks = sum(1 for m in masks_seq if m is not None) if masks_seq else 0
+                        
+                        if valid_masks == 0:
+                            # Runner returned empty result (internal error)
+                            print(f"    ! single-frame warmup returned 0 valid masks (internal error)")
+                            raise RuntimeError("Warmup inference produced no masks")
+                    
                     print("    ✓ Warmup: single-frame run succeeded")
                 except Exception as e1:
                     print(f"    ! single-frame warmup failed: {e1}")
