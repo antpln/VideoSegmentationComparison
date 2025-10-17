@@ -199,6 +199,12 @@ def _configure_torch() -> None:
         torch.set_float32_matmul_precision("high")
     except Exception:  # pragma: no cover
         pass
+    # Match EdgeTAM example: enable global autocast to bfloat16 on CUDA
+    try:
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        print("Autocast: enabled (cuda, bfloat16)")
+    except Exception as e:  # pragma: no cover
+        print(f"Autocast: not enabled ({e})")
 
 
 def run(args: argparse.Namespace) -> Path:

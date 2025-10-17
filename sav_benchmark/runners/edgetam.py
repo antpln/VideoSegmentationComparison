@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+import shutil
 from typing import Dict, List, Optional
 
 import cv2  # type: ignore[import]
 import numpy as np
 import psutil
+import sys
+from typing import Tuple
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 try:
     from EdgeTAM.sam2.build_sam import build_sam2_video_predictor  # type: ignore[import]
@@ -36,6 +43,33 @@ def _read_frame(path: Path) -> np.ndarray:
     if frame is None:
         raise FileNotFoundError(f"Could not read frame {path}")
     return frame
+
+
+def _gpu_debug_snapshot(stage: str) -> None:
+    """Print a concise CPU/GPU memory snapshot for debugging."""
+    try:
+        vm = psutil.virtual_memory()
+        print(f"[DEBUG mem {stage}] CPU used={vm.used/1e9:.2f}G avail={vm.available/1e9:.2f}G rss={psutil.Process().memory_info().rss/1e9:.2f}G")
+    except Exception:
+        pass
+    try:
+        if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            total_free = None
+            try:
+                free_b, total_b = torch.cuda.mem_get_info(dev)
+                total_free = (free_b/1e9, total_b/1e9)
+            except Exception:
+                total_free = None
+            name = torch.cuda.get_device_name(dev)
+            allocated = torch.cuda.memory_allocated(dev)/1e9
+            reserved = torch.cuda.memory_reserved(dev)/1e9
+            max_alloc = torch.cuda.max_memory_allocated(dev)/1e9
+            max_res = torch.cuda.max_memory_reserved(dev)/1e9
+            free_str = f" free={total_free[0]:.2f}G/{total_free[1]:.2f}G" if total_free else ""
+            print(f"[DEBUG cuda {stage}] dev={dev} {name} alloc={allocated:.2f}G resv={reserved:.2f}G max_alloc={max_alloc:.2f}G max_resv={max_res:.2f}G{free_str}")
+    except Exception:
+        pass
 
 
 def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], output_path: Path, fps: float) -> str:
@@ -73,8 +107,11 @@ def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], 
     return str(output_path)
 
 
-def _init_predictor(weight_name: str) -> object:
-    """Build an EdgeTAM video predictor using discovered config/weights."""
+def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optional[int] = None) -> object:
+    """Build an EdgeTAM video predictor using discovered config/weights.
+
+    Honors the optional image_size to reduce memory footprint in a device-agnostic way.
+    """
     if build_sam2_video_predictor is None:
         raise ImportError("EdgeTAM is not installed")
 
@@ -100,7 +137,20 @@ def _init_predictor(weight_name: str) -> object:
     if checkpoint_path is None:
         raise FileNotFoundError(f"EdgeTAM checkpoint not found among: {checkpoint_candidates}")
 
-    return build_sam2_video_predictor(config_file=config_name, ckpt_path=str(checkpoint_path))
+    hydra_overrides_extra = []
+    if image_size is not None:
+        # EdgeTAM config assumes image_size divisible by 64 (e.g., 1024 -> grids 64,16).
+        safe_imgsz = max(64, int(round(int(image_size) / 64) * 64))
+        if safe_imgsz != int(image_size):
+            print(f"[WARN EdgeTAM] Adjusting image_size from {image_size} to nearest multiple-of-64: {safe_imgsz}")
+        hydra_overrides_extra.append(f"++model.image_size={safe_imgsz}")
+
+    return build_sam2_video_predictor(
+        config_file=config_name,
+        ckpt_path=str(checkpoint_path),
+        device=device,
+        hydra_overrides_extra=hydra_overrides_extra,
+    )
 
 
 def _maybe_compile_edgetam_predictor(
@@ -155,7 +205,7 @@ def _run_points(
     compile_backend: str | None = None,
     max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
-    _ = (imgsz, device)
+    _ = ()
     # Translate the mask into positive point prompts.
     # Use a single positive point for fair comparison with SAM2 point prompting.
     points, labels = extract_points_from_mask(prompt_mask, 1)
@@ -183,7 +233,7 @@ def _run_points(
     cpu_peak = process.memory_info().rss
     setup_start = time.perf_counter()
 
-    predictor = _init_predictor(weight_name)
+    predictor = _init_predictor(weight_name, device=device, image_size=imgsz)
     _verify_predictor_interfaces(predictor)
     _maybe_compile_edgetam_predictor(
         predictor,
@@ -191,33 +241,76 @@ def _run_points(
         compile_mode=compile_mode,
         compile_backend=compile_backend,
     )
+    model_imgsz = getattr(predictor, "image_size", None)
+    print(f"[DEBUG EdgeTAM] predictor constructed & compiled (image_size={model_imgsz}, device={device})")
+    _gpu_debug_snapshot("post-predictor-build")
 
     # Focus only on frames from the prompting timestep forward.
     sub_frame_paths = frames_24fps[prompt_frame_idx:]
     first_frame = _read_frame(sub_frame_paths[0])
     height, width = first_frame.shape[:2]
 
-    temp_video = Path(out_dir) / f"__tmp_edgetam_points_{overlay_name or 'clip'}.mp4" if out_dir else Path("__tmp_edgetam_points.mp4")
-    writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"avc1"), clip_fps, (width, height))
-    if not writer.isOpened():  # pragma: no cover
-        raise RuntimeError(f"Could not open video writer for {temp_video}")
+    # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
+    temp_dir = Path(out_dir) / f"__tmp_edgetam_points_{overlay_name or 'clip'}_frames" if out_dir else Path("__tmp_edgetam_points_frames")
     try:
-        for frame_path in sub_frame_paths:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for idx, frame_path in enumerate(sub_frame_paths):
             frame = _read_frame(frame_path)
-            writer.write(frame)
-    finally:
-        writer.release()
+            cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
+        print(f"[DEBUG EdgeTAM] prepared temp frames at {temp_dir} with {len(sub_frame_paths)} images")
+        _gpu_debug_snapshot("after-temp-frames")
+    except Exception as e:
+        raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
     inference_start: float | None = None
     sub_masks_list: List[Optional[np.ndarray]]
 
+    # Separate try/except to pinpoint init_state failures
     try:
-        inference_state = predictor.init_state(str(temp_video))
+        # Keep frames and state on CPU to reduce upfront GPU allocations; load frames lazily
+        print("[DEBUG EdgeTAM] entering init_state(...) with CPU offloading & async frames")
+        _gpu_debug_snapshot("pre-init_state")
+        inference_state = predictor.init_state(
+            str(temp_dir),
+            offload_video_to_cpu=True,
+            offload_state_to_cpu=True,
+            # Match example notebook behavior to avoid races and ensure deterministic shapes
+            async_loading_frames=False,
+        )
+        print("[DEBUG EdgeTAM] init_state completed")
+        _gpu_debug_snapshot("post-init_state")
+    except Exception as e:
+        print(f"[ERROR EdgeTAM] init_state failed: {e}")
+        # Attempt a debug load to inspect frame tensor shapes
+        try:
+            from EdgeTAM.sam2.utils.misc import load_video_frames as _sam2_load_frames  # type: ignore
+            imgs, vH, vW = _sam2_load_frames(
+                video_path=str(temp_dir),
+                image_size=model_imgsz or imgsz,
+                offload_video_to_cpu=True,
+                async_loading_frames=True,
+                compute_device=None if (torch is None or not torch.cuda.is_available()) else torch.device(device),
+            )
+            # Try to inspect first image shape
+            try:
+                first = imgs[0]
+                print(f"[DEBUG EdgeTAM] debug-load: first_frame_shape={getattr(first, 'shape', None)} video(HxW)={vH}x{vW}")
+            except Exception:
+                print(f"[DEBUG EdgeTAM] debug-load: images_type={type(imgs)} video(HxW)={vH}x{vW}")
+        except Exception as e2:
+            print(f"[DEBUG EdgeTAM] secondary debug load failed: {e2}")
+        raise
+
+    try:
         points_np = np.array(points, dtype=np.float32)
         labels_np = np.array(labels, dtype=np.int32)
         predictor.add_new_points_or_box(
             inference_state=inference_state, frame_idx=0, obj_id=1, points=points_np, labels=labels_np
         )
+        print("[DEBUG EdgeTAM] prompt seeded (points)")
+        _gpu_debug_snapshot("post-add-prompt")
         # Start pure inference timing AFTER seeding (parity with SAM2 logic)
         inference_start = time.perf_counter()
 
@@ -226,9 +319,14 @@ def _run_points(
         mask_indices: List[int] = []
         mask_logits_count = 0
         positive_logits_count = 0
+        print("[DEBUG EdgeTAM] starting propagate_in_video()")
+        _gpu_debug_snapshot("pre-propagate")
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
             if mask_logits is None or 1 not in obj_ids:
                 continue
+            if frame_idx == 0:
+                print("[DEBUG EdgeTAM] first propagate yield received")
+                _gpu_debug_snapshot("first-yield")
             mask_logits_count += 1
             if isinstance(mask_logits, (list, tuple)):
                 idx = obj_ids.index(1)
@@ -314,8 +412,10 @@ def _run_points(
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
         _record_overlays(frames_24fps, masks_seq, overlay_path, clip_fps)
 
+    # Cleanup temporary JPEG frames directory
     try:
-        temp_video.unlink(missing_ok=True)
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
     except OSError:
         pass
 
@@ -377,7 +477,7 @@ def _run_bbox(
     cpu_peak = process.memory_info().rss
     setup_start = time.perf_counter()
 
-    predictor = _init_predictor(weight_name)
+    predictor = _init_predictor(weight_name, device=device, image_size=imgsz)
     _verify_predictor_interfaces(predictor)
     _maybe_compile_edgetam_predictor(
         predictor,
@@ -390,21 +490,28 @@ def _run_bbox(
     first_frame = _read_frame(sub_frame_paths[0])
     height, width = first_frame.shape[:2]
 
-    temp_video = Path(out_dir) / f"__tmp_edgetam_bbox_{overlay_name or 'clip'}.mp4" if out_dir else Path("__tmp_edgetam_bbox.mp4")
-    writer = cv2.VideoWriter(str(temp_video), cv2.VideoWriter_fourcc(*"avc1"), clip_fps, (width, height))
-    if not writer.isOpened():  # pragma: no cover
-        raise RuntimeError(f"Could not open video writer for {temp_video}")
+    # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
+    temp_dir = Path(out_dir) / f"__tmp_edgetam_bbox_{overlay_name or 'clip'}_frames" if out_dir else Path("__tmp_edgetam_bbox_frames")
     try:
-        for frame_path in sub_frame_paths:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for idx, frame_path in enumerate(sub_frame_paths):
             frame = _read_frame(frame_path)
-            writer.write(frame)
-    finally:
-        writer.release()
+            cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
+    except Exception as e:
+        raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
     inference_start: float | None = None
 
     try:
-        inference_state = predictor.init_state(str(temp_video))
+        # Keep frames and state on CPU to reduce upfront GPU allocations; load frames lazily
+        inference_state = predictor.init_state(
+            str(temp_dir),
+            offload_video_to_cpu=True,
+            offload_state_to_cpu=True,
+            async_loading_frames=False,
+        )
         predictor.add_new_points_or_box(
             inference_state=inference_state,
             frame_idx=0,
@@ -476,8 +583,10 @@ def _run_bbox(
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
         _record_overlays(frames_24fps, masks_seq, overlay_path, clip_fps)
 
+    # Cleanup temporary JPEG frames directory
     try:
-        temp_video.unlink(missing_ok=True)
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
     except OSError:
         pass
 
