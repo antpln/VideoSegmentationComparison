@@ -67,6 +67,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
+    parser.add_argument(
+        "--autocast",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16", "none"],
+        help="Enable CUDA autocast with the given dtype (bf16/fp16) or disable (none)",
+    )
+    parser.add_argument(
+        "--disable_cudnn",
+        action="store_true",
+        help="Disable cuDNN to reduce conv workspace memory (slower but can avoid OOM)",
+    )
     return parser.parse_args(args=argv)
 
 
@@ -188,21 +200,34 @@ def _prepare_dataset(args: argparse.Namespace) -> Tuple[Path, Path]:
     return split_dir, out_dir
 
 
-def _configure_torch() -> None:
+def _configure_torch(args: argparse.Namespace) -> None:
     """Apply conservative CUDA defaults when GPUs are available."""
     if torch is None or not torch.cuda.is_available():
         print("Using CPU")
         return
     print("CUDA available:", True, "Device:", torch.cuda.get_device_name(0))
+    # Optional: disable cuDNN to reduce conv workspace peaks (slower but can avoid OOM)
+    try:
+        if args.disable_cudnn:
+            torch.backends.cudnn.enabled = False
+            print("cuDNN: disabled")
+    except Exception:
+        pass
     torch.backends.cuda.matmul.allow_tf32 = True
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:  # pragma: no cover
         pass
-    # Match EdgeTAM example: enable global autocast to bfloat16 on CUDA
+    # Configurable global autocast
     try:
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-        print("Autocast: enabled (cuda, bfloat16)")
+        if args.autocast == "bf16":
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+            print("Autocast: enabled (cuda, bfloat16)")
+        elif args.autocast == "fp16":
+            torch.autocast(device_type="cuda", dtype=torch.float16).__enter__()
+            print("Autocast: enabled (cuda, float16)")
+        else:
+            print("Autocast: disabled")
     except Exception as e:  # pragma: no cover
         print(f"Autocast: not enabled ({e})")
 
@@ -215,7 +240,7 @@ def run(args: argparse.Namespace) -> Path:
     if not models:
         raise SystemExit("No valid models selected")
 
-    _configure_torch()
+    _configure_torch(args)
     device = device_str()
 
     video_ids = read_video_ids(split_dir, args.split_name)
