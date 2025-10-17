@@ -144,7 +144,21 @@ def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optio
         safe_imgsz = max(64, int(round(int(image_size) / 64) * 64))
         if safe_imgsz != int(image_size):
             print(f"[WARN EdgeTAM] Adjusting image_size from {image_size} to nearest multiple-of-64: {safe_imgsz}")
-        hydra_overrides_extra.append(f"++model.image_size={safe_imgsz}")
+        
+        # Override image_size and corresponding RoPE attention sizes
+        # feat_sizes for self-attention: stride-32 features = image_size / 32
+        # q_sizes for cross-attention: stride-16 features = image_size / 16
+        # k_sizes for cross-attention: stride-64 features = image_size / 64
+        feat_size = safe_imgsz // 32
+        q_size = safe_imgsz // 16
+        k_size = safe_imgsz // 64
+        
+        hydra_overrides_extra.extend([
+            f"++model.image_size={safe_imgsz}",
+            f"++model.memory_attention.layer.self_attention.feat_sizes=[{feat_size},{feat_size}]",
+            f"++model.memory_attention.layer.cross_attention.q_sizes=[{q_size},{q_size}]",
+            f"++model.memory_attention.layer.cross_attention.k_sizes=[{k_size},{k_size}]",
+        ])
 
     return build_sam2_video_predictor(
         config_file=config_name,
@@ -271,7 +285,8 @@ def _run_points(
     # Separate try/except to pinpoint init_state failures
     try:
         # Keep frames and state on CPU to reduce upfront GPU allocations; load frames lazily
-        print("[DEBUG EdgeTAM] entering init_state(...) with CPU offloading & async frames")
+        print(f"[DEBUG EdgeTAM] entering init_state(...) with CPU offloading & async frames")
+        print(f"[DEBUG EdgeTAM] predictor.image_size = {predictor.image_size}, imgsz arg = {imgsz}")
         _gpu_debug_snapshot("pre-init_state")
         inference_state = predictor.init_state(
             str(temp_dir),
