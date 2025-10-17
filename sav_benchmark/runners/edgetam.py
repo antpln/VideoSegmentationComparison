@@ -12,6 +12,7 @@ import numpy as np
 import psutil
 import sys
 from typing import Tuple
+import traceback
 try:
     import torch  # type: ignore
 except Exception:  # pragma: no cover
@@ -322,61 +323,69 @@ def _run_points(
         print("[DEBUG EdgeTAM] starting propagate_in_video()")
         _gpu_debug_snapshot("pre-propagate")
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            if mask_logits is None or 1 not in obj_ids:
-                continue
-            if frame_idx == 0:
-                print("[DEBUG EdgeTAM] first propagate yield received")
-                _gpu_debug_snapshot("first-yield")
-            mask_logits_count += 1
-            if isinstance(mask_logits, (list, tuple)):
-                idx = obj_ids.index(1)
-                logits = mask_logits[idx]
-            else:
-                logits = mask_logits
-            if logits is None:
-                continue
-            if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
-                continue
-            if hasattr(logits, "detach"):
-                logits_np = logits.detach().cpu().numpy()
-            elif hasattr(logits, "cpu"):
-                logits_np = logits.cpu().numpy()
-            else:
-                logits_np = np.asarray(logits)
-            if logits_np.size == 0:
-                continue
-            if mask_logits_count <= 5:
-                print(
-                    f"[DEBUG EdgeTAM logits] frame={frame_idx} shape={logits_np.shape} min={float(logits_np.min()):.4f} max={float(logits_np.max()):.4f}"
-                )
-            if np.count_nonzero(logits_np) > 0:
-                positive_logits_count += 1
-            tmp = logits_np
-            thr = 0.5 if (tmp.min() >= 0.0 and tmp.max() <= 1.0) else 0.0
-            mask_np = tmp > thr
-            while mask_np.ndim > 2:
-                if mask_np.shape[0] == 1:
-                    mask_np = mask_np[0]
+            try:
+                if mask_logits is None or 1 not in obj_ids:
+                    continue
+                if frame_idx == 0:
+                    print("[DEBUG EdgeTAM] first propagate yield received")
+                    _gpu_debug_snapshot("first-yield")
+                mask_logits_count += 1
+                if isinstance(mask_logits, (list, tuple)):
+                    idx = obj_ids.index(1)
+                    logits = mask_logits[idx]
                 else:
-                    mask_np = np.any(mask_np, axis=0)
-            if mask_np.ndim != 2:
-                continue
-            mask_np = mask_np.astype(bool)
-            if mask_np.size == 0:
-                continue
-            if mask_np.shape != (height, width):
-                mask_np = cv2.resize(
-                    mask_np.astype(np.uint8),
-                    (width, height),
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-            if 0 <= frame_idx < len(sub_frame_paths):
-                sub_masks[frame_idx] = mask_np
-                mask_indices.append(frame_idx)
-                # Remove oldest if exceeding max_frames_in_mem
-                if len(mask_indices) > max_frames_in_mem:
-                    oldest = mask_indices.pop(0)
-                    del sub_masks[oldest]
+                    logits = mask_logits
+                if logits is None:
+                    continue
+                if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
+                    continue
+                if hasattr(logits, "detach"):
+                    logits_np = logits.detach().cpu().numpy()
+                elif hasattr(logits, "cpu"):
+                    logits_np = logits.cpu().numpy()
+                else:
+                    logits_np = np.asarray(logits)
+                if logits_np.size == 0:
+                    continue
+                if mask_logits_count <= 5:
+                    print(
+                        f"[DEBUG EdgeTAM logits] frame={frame_idx} shape={logits_np.shape} min={float(logits_np.min()):.4f} max={float(logits_np.max()):.4f}"
+                    )
+                if np.count_nonzero(logits_np) > 0:
+                    positive_logits_count += 1
+                tmp = logits_np
+                thr = 0.5 if (tmp.min() >= 0.0 and tmp.max() <= 1.0) else 0.0
+                mask_np = tmp > thr
+                # Squeeze singleton dims (e.g., (1,1,H,W))
+                while mask_np.ndim > 2:
+                    if mask_np.shape[0] == 1:
+                        mask_np = mask_np[0]
+                    else:
+                        mask_np = np.any(mask_np, axis=0)
+                if mask_np.ndim != 2:
+                    continue
+                mask_np = mask_np.astype(bool)
+                if mask_np.size == 0:
+                    continue
+                # Handle swapped (W,H) by transposing if it exactly matches the swapped dims
+                if mask_np.shape == (width, height):
+                    mask_np = mask_np.T
+                if mask_np.shape != (height, width):
+                    mask_np = cv2.resize(
+                        mask_np.astype(np.uint8),
+                        (width, height),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                if 0 <= frame_idx < len(sub_frame_paths):
+                    sub_masks[frame_idx] = mask_np
+                    mask_indices.append(frame_idx)
+                    # Remove oldest if exceeding max_frames_in_mem
+                    if len(mask_indices) > max_frames_in_mem:
+                        oldest = mask_indices.pop(0)
+                        del sub_masks[oldest]
+            except Exception as per_frame_exc:
+                print(f"[ERROR EdgeTAM] per-frame failure at frame {frame_idx}: {per_frame_exc}")
+                print(traceback.format_exc())
         # Convert sub_masks dict to list for output (None for missing)
         sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frame_paths))]
 
@@ -385,6 +394,7 @@ def _run_points(
         )
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
+        print(traceback.format_exc())
         sub_masks_list = [None] * len(sub_frame_paths)
         if inference_start is None:
             inference_start = time.perf_counter()
