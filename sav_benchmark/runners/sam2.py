@@ -513,6 +513,7 @@ class SAM2(Model):
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
+        max_frames_in_mem: int = 600,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
@@ -527,6 +528,7 @@ class SAM2(Model):
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
+            max_frames_in_mem=max_frames_in_mem,
         )
 
     def run_bbox(
@@ -544,6 +546,7 @@ class SAM2(Model):
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
+        max_frames_in_mem: int = 600,
     ) -> Dict[str, object]:
         return _run_bbox(
             frames_24fps,
@@ -558,6 +561,7 @@ class SAM2(Model):
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
+            max_frames_in_mem=max_frames_in_mem,
         )
 
 
