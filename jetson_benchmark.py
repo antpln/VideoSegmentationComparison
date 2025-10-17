@@ -335,7 +335,8 @@ def warmup_models(args: argparse.Namespace, model_tags: List[str]):
             try:
                 runner = _select_runner(tag)
                 
-                # Prepare kwargs for warmup; safe_call_runner will strip unsupported ones.
+                # Prepare minimal kwargs for warmup
+                # Don't pass max_frames_in_mem - it's only used internally by runners
                 warmup_kwargs = dict(
                     frames_24fps=dummy_frames,
                     prompt_frame_idx=0,
@@ -347,10 +348,9 @@ def warmup_models(args: argparse.Namespace, model_tags: List[str]):
                     overlay_name=None,
                     clip_fps=24.0,
                     compile_model=False,  # Don't compile in setup
-                    max_frames_in_mem=10,
                 )
                 
-                # Run warmup (all args are now aligned across runners)
+                # Run warmup with standard runner interface
                 result = runner(**warmup_kwargs)
                 
                 print(f"    ✓ Warmup complete")

@@ -61,7 +61,6 @@ class Model(ABC):
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
-        max_frames_in_mem: int = 600,
     ) -> Dict[str, object]:
         raise NotImplementedError(f"{self.name} does not support point prompts")
 
@@ -80,7 +79,6 @@ class Model(ABC):
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
-        max_frames_in_mem: int = 600,
     ) -> Dict[str, object]:
         raise NotImplementedError(f"{self.name} does not support box prompts")
 
