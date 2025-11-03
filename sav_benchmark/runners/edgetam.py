@@ -13,6 +13,7 @@ import psutil
 import sys
 from typing import Tuple
 import traceback
+from contextlib import nullcontext
 try:
     import torch  # type: ignore
 except Exception:  # pragma: no cover
@@ -26,7 +27,7 @@ except Exception:  # pragma: no cover - EdgeTAM optional
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
 from .base import Model
 from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
-from ..video_ops import overlay_union, write_video_mp4
+from ..video_ops import overlay_video_frames, prepare_frame_stream
 
 
 def _find_existing(paths: List[str]) -> Optional[Path]:
@@ -36,14 +37,6 @@ def _find_existing(paths: List[str]) -> Optional[Path]:
         if resolved.exists():
             return resolved
     return None
-
-
-def _read_frame(path: Path) -> np.ndarray:
-    """Load a single frame as a BGR numpy array."""
-    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise FileNotFoundError(f"Could not read frame {path}")
-    return frame
 
 
 def _gpu_debug_snapshot(stage: str) -> None:
@@ -71,41 +64,6 @@ def _gpu_debug_snapshot(stage: str) -> None:
             print(f"[DEBUG cuda {stage}] dev={dev} {name} alloc={allocated:.2f}G resv={reserved:.2f}G max_alloc={max_alloc:.2f}G max_resv={max_res:.2f}G{free_str}")
     except Exception:
         pass
-
-
-def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], output_path: Path, fps: float) -> str:
-    """Write an overlay video that blends predictions with their source frames."""
-    overlays: List[np.ndarray] = []
-    for idx, frame_path in enumerate(frames):
-        frame = _read_frame(frame_path)
-        mask = masks_seq[idx] if idx < len(masks_seq) else None
-        if mask is None:
-            overlays.append(frame)
-            continue
-        mask_arr = np.asarray(mask)
-        if mask_arr.size == 0:
-            overlays.append(frame)
-            continue
-        if mask_arr.ndim > 2:
-            mask_arr = np.any(mask_arr.astype(bool), axis=0)
-        else:
-            mask_arr = mask_arr.astype(bool)
-        if mask_arr.ndim != 2:
-            overlays.append(frame)
-            continue
-        # Handle potential transposed (H,W) mismatch (e.g., logits came as (W,H)).
-        if mask_arr.shape[0] == frame.shape[1] and mask_arr.shape[1] == frame.shape[0]:
-            # Transpose to match frame (H,W)
-            mask_arr = mask_arr.T
-        if mask_arr.shape != frame.shape[:2]:
-            mask_arr = cv2.resize(
-                mask_arr.astype(np.uint8),
-                (frame.shape[1], frame.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
-        overlays.append(overlay_union(frame, mask_arr, alpha=0.5))
-    write_video_mp4(output_path, overlays, fps)
-    return str(output_path)
 
 
 def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optional[int] = None, compile_image_encoder: bool = False) -> object:
@@ -219,6 +177,7 @@ def _run_points(
     clip_fps: float = 24.0,
     num_points: int = 5,
     *,
+    precision=None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
@@ -241,8 +200,26 @@ def _run_points(
             "frames": len(frames_24fps),
             "H": prompt_mask.shape[0],
             "W": prompt_mask.shape[1],
+            "infer_H": prompt_mask.shape[0],
+            "infer_W": prompt_mask.shape[1],
             "num_points": 0,
         }
+
+    total_frames = len(frames_24fps)
+    if prompt_frame_idx >= total_frames:
+        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+
+    sub_frame_paths = frames_24fps[prompt_frame_idx:]
+    sub_frame_count = len(sub_frame_paths)
+    if sub_frame_count == 0:
+        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+
+    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
+    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    height, width = prompt_stream.target_hw
+    orig_height, orig_width = prompt_stream.original_hw
+    scale_x, scale_y = prompt_stream.scale_xy
+    precision_scope = precision if precision is not None else (lambda: nullcontext())
 
     # Fairness alignment with SAM2: start GPU peak tracking BEFORE predictor build
     # and separate setup (predictor build + clip write + init_state + prompt seeding)
@@ -264,21 +241,17 @@ def _run_points(
     print(f"[DEBUG EdgeTAM] predictor constructed & compiled (image_size={model_imgsz}, device={device})")
     _gpu_debug_snapshot("post-predictor-build")
 
-    # Focus only on frames from the prompting timestep forward.
-    sub_frame_paths = frames_24fps[prompt_frame_idx:]
-    first_frame = _read_frame(sub_frame_paths[0])
-    height, width = first_frame.shape[:2]
-
     # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
     temp_dir = Path(out_dir) / f"__tmp_edgetam_points_{overlay_name or 'clip'}_frames" if out_dir else Path("__tmp_edgetam_points_frames")
     try:
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
-        for idx, frame_path in enumerate(sub_frame_paths):
-            frame = _read_frame(frame_path)
+        for idx, frame in enumerate(prompt_stream.generator()):
             cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
-        print(f"[DEBUG EdgeTAM] prepared temp frames at {temp_dir} with {len(sub_frame_paths)} images")
+        print(
+            f"[DEBUG EdgeTAM] prepared temp frames at {temp_dir} with {sub_frame_count} images (orig={orig_height}x{orig_width} -> infer={height}x{width})"
+        )
         _gpu_debug_snapshot("after-temp-frames")
     except Exception as e:
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
@@ -292,13 +265,14 @@ def _run_points(
         print(f"[DEBUG EdgeTAM] entering init_state(...) with CPU offloading & async frames")
         print(f"[DEBUG EdgeTAM] predictor.image_size = {predictor.image_size}, imgsz arg = {imgsz}")
         _gpu_debug_snapshot("pre-init_state")
-        inference_state = predictor.init_state(
-            str(temp_dir),
-            offload_video_to_cpu=True,
-            offload_state_to_cpu=True,
-            # Match example notebook behavior to avoid races and ensure deterministic shapes
-            async_loading_frames=False,
-        )
+        with precision_scope():
+            inference_state = predictor.init_state(
+                str(temp_dir),
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+                # Match example notebook behavior to avoid races and ensure deterministic shapes
+                async_loading_frames=False,
+            )
         print("[DEBUG EdgeTAM] init_state completed")
         _gpu_debug_snapshot("post-init_state")
     except Exception as e:
@@ -324,89 +298,91 @@ def _run_points(
         raise
 
     try:
-        points_np = np.array(points, dtype=np.float32)
+        points_np = np.array([[p[0] * scale_x, p[1] * scale_y] for p in points], dtype=np.float32)
+        points_np[:, 0] = np.clip(points_np[:, 0], 0, max(0, width - 1))
+        points_np[:, 1] = np.clip(points_np[:, 1], 0, max(0, height - 1))
         labels_np = np.array(labels, dtype=np.int32)
-        predictor.add_new_points_or_box(
-            inference_state=inference_state, frame_idx=0, obj_id=1, points=points_np, labels=labels_np
-        )
-        print("[DEBUG EdgeTAM] prompt seeded (points)")
-        _gpu_debug_snapshot("post-add-prompt")
-        # Start pure inference timing AFTER seeding (parity with SAM2 logic)
-        inference_start = time.perf_counter()
-
-        # Replace sub_masks with a dict for sliding window
         sub_masks: Dict[int, Optional[np.ndarray]] = {}
         mask_indices: List[int] = []
         mask_logits_count = 0
         positive_logits_count = 0
-        print("[DEBUG EdgeTAM] starting propagate_in_video()")
-        _gpu_debug_snapshot("pre-propagate")
-        for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            try:
-                if mask_logits is None or 1 not in obj_ids:
-                    continue
-                if frame_idx == 0:
-                    print("[DEBUG EdgeTAM] first propagate yield received")
-                    _gpu_debug_snapshot("first-yield")
-                mask_logits_count += 1
-                if isinstance(mask_logits, (list, tuple)):
-                    idx = obj_ids.index(1)
-                    logits = mask_logits[idx]
-                else:
-                    logits = mask_logits
-                if logits is None:
-                    continue
-                if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
-                    continue
-                if hasattr(logits, "detach"):
-                    logits_np = logits.detach().cpu().numpy()
-                elif hasattr(logits, "cpu"):
-                    logits_np = logits.cpu().numpy()
-                else:
-                    logits_np = np.asarray(logits)
-                if logits_np.size == 0:
-                    continue
-                if mask_logits_count <= 5:
-                    print(
-                        f"[DEBUG EdgeTAM logits] frame={frame_idx} shape={logits_np.shape} min={float(logits_np.min()):.4f} max={float(logits_np.max()):.4f}"
-                    )
-                if np.count_nonzero(logits_np) > 0:
-                    positive_logits_count += 1
-                tmp = logits_np
-                thr = 0.5 if (tmp.min() >= 0.0 and tmp.max() <= 1.0) else 0.0
-                mask_np = tmp > thr
-                # Squeeze singleton dims (e.g., (1,1,H,W))
-                while mask_np.ndim > 2:
-                    if mask_np.shape[0] == 1:
-                        mask_np = mask_np[0]
+        with precision_scope():
+            predictor.add_new_points_or_box(
+                inference_state=inference_state, frame_idx=0, obj_id=1, points=points_np, labels=labels_np
+            )
+            print("[DEBUG EdgeTAM] prompt seeded (points)")
+            _gpu_debug_snapshot("post-add-prompt")
+            # Start pure inference timing AFTER seeding (parity with SAM2 logic)
+            inference_start = time.perf_counter()
+
+            print("[DEBUG EdgeTAM] starting propagate_in_video()")
+            _gpu_debug_snapshot("pre-propagate")
+            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+                try:
+                    if mask_logits is None or 1 not in obj_ids:
+                        continue
+                    if frame_idx == 0:
+                        print("[DEBUG EdgeTAM] first propagate yield received")
+                        _gpu_debug_snapshot("first-yield")
+                    mask_logits_count += 1
+                    if isinstance(mask_logits, (list, tuple)):
+                        idx = obj_ids.index(1)
+                        logits = mask_logits[idx]
                     else:
-                        mask_np = np.any(mask_np, axis=0)
-                if mask_np.ndim != 2:
-                    continue
-                mask_np = mask_np.astype(bool)
-                if mask_np.size == 0:
-                    continue
-                # Handle swapped (W,H) by transposing if it exactly matches the swapped dims
-                if mask_np.shape == (width, height):
-                    mask_np = mask_np.T
-                if mask_np.shape != (height, width):
-                    mask_np = cv2.resize(
-                        mask_np.astype(np.uint8),
-                        (width, height),
-                        interpolation=cv2.INTER_NEAREST,
-                    ).astype(bool)
-                if 0 <= frame_idx < len(sub_frame_paths):
-                    sub_masks[frame_idx] = mask_np
-                    mask_indices.append(frame_idx)
-                    # Remove oldest if exceeding max_frames_in_mem
-                    if len(mask_indices) > max_frames_in_mem:
-                        oldest = mask_indices.pop(0)
-                        del sub_masks[oldest]
-            except Exception as per_frame_exc:
-                print(f"[ERROR EdgeTAM] per-frame failure at frame {frame_idx}: {per_frame_exc}")
-                print(traceback.format_exc())
+                        logits = mask_logits
+                    if logits is None:
+                        continue
+                    if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
+                        continue
+                    if hasattr(logits, "detach"):
+                        logits_np = logits.detach().cpu().numpy()
+                    elif hasattr(logits, "cpu"):
+                        logits_np = logits.cpu().numpy()
+                    else:
+                        logits_np = np.asarray(logits)
+                    if logits_np.size == 0:
+                        continue
+                    if mask_logits_count <= 5:
+                        print(
+                            f"[DEBUG EdgeTAM logits] frame={frame_idx} shape={logits_np.shape} min={float(logits_np.min()):.4f} max={float(logits_np.max()):.4f}"
+                        )
+                    if np.count_nonzero(logits_np) > 0:
+                        positive_logits_count += 1
+                    tmp = logits_np
+                    thr = 0.5 if (tmp.min() >= 0.0 and tmp.max() <= 1.0) else 0.0
+                    mask_np = tmp > thr
+                    # Squeeze singleton dims (e.g., (1,1,H,W))
+                    while mask_np.ndim > 2:
+                        if mask_np.shape[0] == 1:
+                            mask_np = mask_np[0]
+                        else:
+                            mask_np = np.any(mask_np, axis=0)
+                    if mask_np.ndim != 2:
+                        continue
+                    mask_np = mask_np.astype(bool)
+                    if mask_np.size == 0:
+                        continue
+                    # Handle swapped (W,H) by transposing if it exactly matches the swapped dims
+                    if mask_np.shape == (width, height):
+                        mask_np = mask_np.T
+                        if mask_np.shape != (height, width):
+                            mask_np = cv2.resize(
+                                mask_np.astype(np.uint8),
+                                (width, height),
+                                interpolation=cv2.INTER_NEAREST,
+                            ).astype(bool)
+                    if 0 <= frame_idx < sub_frame_count:
+                        sub_masks[frame_idx] = mask_np
+                        mask_indices.append(frame_idx)
+                        # Remove oldest if exceeding max_frames_in_mem
+                        if len(mask_indices) > max_frames_in_mem:
+                            oldest = mask_indices.pop(0)
+                            del sub_masks[oldest]
+                except Exception as per_frame_exc:
+                    print(f"[ERROR EdgeTAM] per-frame failure at frame {frame_idx}: {per_frame_exc}")
+                    print(traceback.format_exc())
         # Convert sub_masks dict to list for output (None for missing)
-        sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frame_paths))]
+        sub_masks_list = [sub_masks.get(i, None) for i in range(sub_frame_count)]
 
         print(
             f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks_list)}"
@@ -414,7 +390,7 @@ def _run_points(
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM points inference failed: {exc}")
         print(traceback.format_exc())
-        sub_masks_list = [None] * len(sub_frame_paths)
+        sub_masks_list = [None] * sub_frame_count
         if inference_start is None:
             inference_start = time.perf_counter()
 
@@ -427,19 +403,25 @@ def _run_points(
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
     if 'sub_masks_list' not in locals():
-        sub_masks_list = [None] * len(sub_frame_paths)
+        sub_masks_list = [None] * sub_frame_count
     masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
     # Debug: log mask statistics
     valid_masks = sum(1 for m in masks_seq if m is not None)
-    total_frames = len(masks_seq)
-    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_frames} frames have masks")
+    total_masks = len(masks_seq)
+    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_masks} frames have masks")
 
     overlay_path = None
     if out_dir and overlay_name:
         # Persist overlays only on demand.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
-        _record_overlays(frames_24fps, masks_seq, overlay_path, clip_fps)
+        overlay_video_frames(
+            frames_24fps,
+            masks_seq,
+            output_path=overlay_path,
+            fps=clip_fps,
+            target_hw=full_stream.target_hw,
+        )
 
     # Cleanup temporary JPEG frames directory
     try:
@@ -448,21 +430,24 @@ def _run_points(
     except OSError:
         pass
 
-    fps = len(sub_frame_paths) / duration
+    fps = sub_frame_count / duration if sub_frame_count else 0.0
+    latency_ms = 1000.0 / fps if fps > 0 else None
 
     return {
         "secs": duration,
         "fps": fps,
-        "latency_ms": 1000.0 / fps,
+        "latency_ms": latency_ms,
         "gpu_peak_alloc": gpu_alloc,
         "gpu_peak_reserved": gpu_reserved,
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": len(frames_24fps),
-        "H": height,
-        "W": width,
-    "num_points": len(points),  # will be 1 under the single-point policy
+        "frames": total_frames,
+        "H": orig_height,
+        "W": orig_width,
+        "infer_H": height,
+        "infer_W": width,
+        "num_points": len(points),  # will be 1 under the single-point policy
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
@@ -498,6 +483,8 @@ def _run_bbox(
             "frames": len(frames_24fps),
             "H": 0,
             "W": 0,
+            "infer_H": 0,
+            "infer_W": 0,
         }
 
     # Align fairness: track GPU peaks from predictor build; separate setup vs inference.
@@ -515,9 +502,19 @@ def _run_bbox(
         compile_backend=compile_backend,
     )
 
+    total_frames = len(frames_24fps)
+    if prompt_frame_idx >= total_frames:
+        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
     sub_frame_paths = frames_24fps[prompt_frame_idx:]
-    first_frame = _read_frame(sub_frame_paths[0])
-    height, width = first_frame.shape[:2]
+    sub_frame_count = len(sub_frame_paths)
+    if sub_frame_count == 0:
+        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+
+    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
+    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    height, width = prompt_stream.target_hw
+    orig_height, orig_width = prompt_stream.original_hw
+    scale_x, scale_y = prompt_stream.scale_xy
 
     # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
     temp_dir = Path(out_dir) / f"__tmp_edgetam_bbox_{overlay_name or 'clip'}_frames" if out_dir else Path("__tmp_edgetam_bbox_frames")
@@ -525,69 +522,83 @@ def _run_bbox(
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
-        for idx, frame_path in enumerate(sub_frame_paths):
-            frame = _read_frame(frame_path)
+        for idx, frame in enumerate(prompt_stream.generator()):
             cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
     except Exception as e:
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
     inference_start: float | None = None
+    bbox_np = np.array(bbox, dtype=np.float32)
 
     try:
         # Keep frames and state on CPU to reduce upfront GPU allocations; load frames lazily
-        inference_state = predictor.init_state(
-            str(temp_dir),
-            offload_video_to_cpu=True,
-            offload_state_to_cpu=True,
-            async_loading_frames=False,
+        with precision_scope():
+            inference_state = predictor.init_state(
+                str(temp_dir),
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+                async_loading_frames=False,
+            )
+        x1, y1, x2, y2 = bbox
+        scaled_x = sorted([x1 * scale_x, x2 * scale_x])
+        scaled_y = sorted([y1 * scale_y, y2 * scale_y])
+        bbox_np = np.array(
+            [
+                np.clip(scaled_x[0], 0, max(0, width - 1)),
+                np.clip(scaled_y[0], 0, max(0, height - 1)),
+                np.clip(scaled_x[1], 0, max(0, width - 1)),
+                np.clip(scaled_y[1], 0, max(0, height - 1)),
+            ],
+            dtype=np.float32,
         )
-        predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=0,
-            obj_id=1,
-            box=np.array(bbox, dtype=np.float32),
-        )
-        inference_start = time.perf_counter()
-        sub_masks: List[Optional[np.ndarray]] = [None] * len(sub_frame_paths)
-        for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            if mask_logits is None or 1 not in obj_ids:
-                continue
-            if isinstance(mask_logits, (list, tuple)):
-                idx = obj_ids.index(1)
-                logits = mask_logits[idx]
-            else:
-                logits = mask_logits
-            if logits is None:
-                continue
-            if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
-                continue
-            if hasattr(logits, "detach"):
-                logits_np = logits.detach().cpu().numpy()
-            elif hasattr(logits, "cpu"):
-                logits_np = logits.cpu().numpy()
-            else:
-                logits_np = np.asarray(logits)
-            if logits_np.size == 0:
-                continue
-            mask_np = logits_np > 0.0
-            if mask_np.ndim > 2:
-                mask_np = np.any(mask_np, axis=0)
-            if mask_np.ndim != 2:
-                continue
-            mask_np = mask_np.astype(bool)
-            if mask_np.size == 0:
-                continue
-            if mask_np.shape != (height, width):
-                mask_np = cv2.resize(
-                    mask_np.astype(np.uint8),
-                    (width, height),
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-            if 0 <= frame_idx < len(sub_masks):
-                sub_masks[frame_idx] = mask_np
+        with precision_scope():
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=1,
+                box=bbox_np,
+            )
+            inference_start = time.perf_counter()
+            sub_masks: List[Optional[np.ndarray]] = [None] * sub_frame_count
+            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+                if mask_logits is None or 1 not in obj_ids:
+                    continue
+                if isinstance(mask_logits, (list, tuple)):
+                    idx = obj_ids.index(1)
+                    logits = mask_logits[idx]
+                else:
+                    logits = mask_logits
+                if logits is None:
+                    continue
+                if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
+                    continue
+                if hasattr(logits, "detach"):
+                    logits_np = logits.detach().cpu().numpy()
+                elif hasattr(logits, "cpu"):
+                    logits_np = logits.cpu().numpy()
+                else:
+                    logits_np = np.asarray(logits)
+                if logits_np.size == 0:
+                    continue
+                mask_np = logits_np > 0.0
+                if mask_np.ndim > 2:
+                    mask_np = np.any(mask_np, axis=0)
+                if mask_np.ndim != 2:
+                    continue
+                mask_np = mask_np.astype(bool)
+                if mask_np.size == 0:
+                    continue
+                if mask_np.shape != (height, width):
+                    mask_np = cv2.resize(
+                        mask_np.astype(np.uint8),
+                        (width, height),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                if 0 <= frame_idx < sub_frame_count:
+                    sub_masks[frame_idx] = mask_np
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
-        sub_masks = [None] * len(sub_frame_paths)
+        sub_masks = [None] * sub_frame_count
         if inference_start is None:
             inference_start = time.perf_counter()
 
@@ -603,14 +614,20 @@ def _run_bbox(
 
     # Debug: log mask statistics
     valid_masks = sum(1 for m in masks_seq if m is not None)
-    total_frames = len(masks_seq)
-    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_frames} frames have masks")
+    total_masks = len(masks_seq)
+    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_masks} frames have masks")
 
     overlay_path = None
     if out_dir and overlay_name:
         # Persist overlays only on demand.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
-        _record_overlays(frames_24fps, masks_seq, overlay_path, clip_fps)
+        overlay_video_frames(
+            frames_24fps,
+            masks_seq,
+            output_path=overlay_path,
+            fps=clip_fps,
+            target_hw=full_stream.target_hw,
+        )
 
     # Cleanup temporary JPEG frames directory
     try:
@@ -619,21 +636,26 @@ def _run_bbox(
     except OSError:
         pass
 
-    fps = len(sub_frame_paths) / duration
+    fps = sub_frame_count / duration if sub_frame_count else 0.0
+    latency_ms = 1000.0 / fps if fps > 0 else None
+    bbox_list = bbox_np.astype(float).tolist()
 
     return {
         "secs": duration,
         "fps": fps,
-        "latency_ms": 1000.0 / fps,
+        "latency_ms": latency_ms,
         "gpu_peak_alloc": gpu_alloc,
         "gpu_peak_reserved": gpu_reserved,
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": len(frames_24fps),
-        "H": height,
-        "W": width,
+        "frames": total_frames,
+        "H": orig_height,
+        "W": orig_width,
+        "infer_H": height,
+        "infer_W": width,
         "bbox": bbox,
+        "bbox_infer": bbox_list,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
@@ -657,6 +679,7 @@ class EdgeTAM(Model):
         clip_fps: float = 24.0,
         num_points: int = 5,
         *,
+        precision=None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -672,6 +695,7 @@ class EdgeTAM(Model):
             overlay_name=overlay_name,
             clip_fps=clip_fps,
             num_points=num_points,
+            precision=precision,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
@@ -689,6 +713,7 @@ class EdgeTAM(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
+        precision=None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -703,6 +728,7 @@ class EdgeTAM(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            precision=precision,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -19,56 +20,13 @@ except Exception:  # pragma: no cover - ultralytics optional
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
 from .base import Model
 from ..utils import cuda_sync, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
-from ..video_ops import overlay_union, write_video_mp4
-
-
-def _read_frames(frame_paths: Iterable[Path]) -> List[np.ndarray]:
-    """Load frames as BGR numpy arrays."""
-    frames: List[np.ndarray] = []
-    for path in frame_paths:
-        frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise FileNotFoundError(f"Could not read frame {path}")
-        frames.append(frame)
-    return frames
+from ..video_ops import overlay_video_frames, prepare_frame_stream, write_video_mp4
 
 
 def _temp_video(prefix: str) -> Path:
     """Generate a unique mp4 path in the temp directory."""
     handle = Path(tempfile.gettempdir()) / f"{prefix}{time.time_ns()}.mp4"
     return handle
-
-
-def _record_overlays(frames: List[np.ndarray], masks_seq: List[Optional[np.ndarray]], output_path: Path, fps: float) -> str:
-    """Blend mask overlays onto frames to aid visual inspection."""
-    if not frames:
-        return ""
-    overlays: List[np.ndarray] = []
-    for idx, frame in enumerate(frames):
-        mask = masks_seq[idx] if idx < len(masks_seq) else None
-        if mask is None:
-            overlays.append(frame)
-            continue
-        mask_arr = np.asarray(mask)
-        if mask_arr.size == 0:
-            overlays.append(frame)
-            continue
-        if mask_arr.ndim > 2:
-            mask_arr = np.any(mask_arr.astype(bool), axis=0)
-        else:
-            mask_arr = mask_arr.astype(bool)
-        if mask_arr.ndim != 2:
-            overlays.append(frame)
-            continue
-        if mask_arr.shape != frame.shape[:2]:
-            mask_arr = cv2.resize(
-                mask_arr.astype(np.uint8),
-                (frame.shape[1], frame.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
-        overlays.append(overlay_union(frame, mask_arr, alpha=0.5))
-    write_video_mp4(output_path, overlays, fps)
-    return str(output_path)
 
 
 def _result_to_mask(result: object) -> Optional[np.ndarray]:
@@ -123,6 +81,7 @@ def _run_points(
     clip_fps: float = 24.0,
     num_points: int = 5,
     *,
+    precision=None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
@@ -146,16 +105,23 @@ def _run_points(
             "num_points": 0,
         }
 
-    frames = _read_frames(frames_24fps)
-    # Only propagate from the prompt frame onwards.
-    sub_frames = frames[prompt_frame_idx:]
-    if not sub_frames:
-        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {len(frames)} frames")
-    height, width = sub_frames[0].shape[:2]
+    precision_scope = precision if precision is not None else (lambda: nullcontext())
 
-    # SAM2 expects a video file; write the subsequence to a temporary mp4.
+    total_frames = len(frames_24fps)
+    if prompt_frame_idx >= total_frames:
+        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+
+    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
+    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    infer_h, infer_w = prompt_stream.target_hw
+    orig_h, orig_w = prompt_stream.original_hw
+    print(
+        f"[DEBUG SAM2 {overlay_name or ''}] resolution orig={orig_w}x{orig_h} -> infer={infer_w}x{infer_h}"
+    )
+
+    # SAM2 expects a video file; write the subsequence to a temporary mp4 using a generator.
     tmp_mp4 = _temp_video("sam2_points_")
-    write_video_mp4(tmp_mp4, sub_frames, clip_fps)
+    write_video_mp4(tmp_mp4, prompt_stream.generator(), clip_fps)
 
     process = psutil.Process()
     reset_gpu_peaks()
@@ -177,6 +143,16 @@ def _run_points(
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     mask_indices: List[int] = []
     inference_start: float | None = None
+    sub_frame_count = total_frames - prompt_frame_idx
+
+    scale_x, scale_y = prompt_stream.scale_xy
+    points_np = np.array([[p[0] * scale_x, p[1] * scale_y] for p in points], dtype=np.float32)
+    points_np[:, 0] = np.clip(points_np[:, 0], 0, max(0, infer_w - 1))
+    points_np[:, 1] = np.clip(points_np[:, 1], 0, max(0, infer_h - 1))
+    points_list = points_np.tolist()
+    labels_np = np.array(labels, dtype=np.int32)
+    labels_list = labels_np.tolist()
+
     try:
         predictor = _sam2_predictor(overrides)
         # Optionally wrap the underlying module in torch.compile.
@@ -193,73 +169,73 @@ def _run_points(
         )
 
         if has_video_api:
-            # Seed the tracker with user prompts on the first frame.
-            inference_state = predictor.init_state(str(tmp_mp4))
-            points_np = np.array(points, dtype=np.float32)
-            labels_np = np.array(labels, dtype=np.int32)
-            predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=0,
-                obj_id=1,
-                points=points_np,
-                labels=labels_np,
-            )
-            # Start timing AFTER predictor build, init_state, and prompt seeding.
-            inference_start = time.perf_counter()
+            with precision_scope():
+                # Seed the tracker with user prompts on the first frame.
+                inference_state = predictor.init_state(str(tmp_mp4))
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=1,
+                    points=points_np,
+                    labels=labels_np,
+                )
+                # Start timing AFTER predictor build, init_state, and prompt seeding.
+                inference_start = time.perf_counter()
 
-            # Collect masks produced for each propagated frame.
-            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-                if mask_logits is not None and len(mask_logits) > 0:
-                    mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
-                    if mask.ndim > 2:
-                        mask = np.any(mask, axis=0)
-                    if mask.shape != (height, width):
-                        mask = cv2.resize(
-                            mask.astype(np.uint8),
-                            (width, height),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                    if 0 <= frame_idx < len(sub_masks):
-                        sub_masks[frame_idx] = mask
-                        mask_indices.append(frame_idx)
-                        # Remove oldest if exceeding max_frames_in_mem
-                        if len(mask_indices) > max_frames_in_mem:
-                            oldest = mask_indices.pop(0)
-                            del sub_masks[oldest]
+                # Collect masks produced for each propagated frame.
+                for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+                    if mask_logits is not None and len(mask_logits) > 0:
+                        mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
+                        if mask.ndim > 2:
+                            mask = np.any(mask, axis=0)
+                        if mask.shape != (infer_h, infer_w):
+                            mask = cv2.resize(
+                                mask.astype(np.uint8),
+                                (infer_w, infer_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            ).astype(bool)
+                        if 0 <= frame_idx < sub_frame_count:
+                            sub_masks[frame_idx] = mask
+                            mask_indices.append(frame_idx)
+                            # Remove oldest if exceeding max_frames_in_mem
+                            if len(mask_indices) > max_frames_in_mem:
+                                oldest = mask_indices.pop(0)
+                                del sub_masks[oldest]
         else:
             # Fallback for newer Ultralytics builds that only expose the streaming API.
-            iterator = None
-            for kwargs in (
-                {"stream": True, "points": points, "labels": labels},
-                {"points": points, "labels": labels},
-            ):
-                try:
-                    iterator = predictor(source=str(tmp_mp4), **kwargs)
-                    break
-                except TypeError:
-                    continue
-            if iterator is None:
-                raise TypeError("SAM2VideoPredictor streaming interface not supported by this build")
-            inference_start = time.perf_counter()
+            with precision_scope():
+                iterator = None
+                for kwargs in (
+                    {"stream": True, "points": points_list, "labels": labels_list},
+                    {"points": points_list, "labels": labels_list},
+                ):
+                    try:
+                        iterator = predictor(source=str(tmp_mp4), **kwargs)
+                        break
+                    except TypeError:
+                        continue
+                if iterator is None:
+                    raise TypeError("SAM2VideoPredictor streaming interface not supported by this build")
+                inference_start = time.perf_counter()
 
-            for idx, result in enumerate(iterator):
-                mask = _result_to_mask(result)
-                if mask is not None:
-                    if mask.ndim > 2:
-                        mask = np.any(mask.astype(bool), axis=0)
-                    else:
-                        mask = mask.astype(bool)
-                    if mask.shape != (height, width):
-                        mask = cv2.resize(
-                            mask.astype(np.uint8),
-                            (width, height),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                if mask is not None and idx < len(sub_masks):
-                    sub_masks[idx] = mask
+                for idx, result in enumerate(iterator):
+                    mask = _result_to_mask(result)
+                    if mask is not None:
+                        if mask.ndim > 2:
+                            mask = np.any(mask.astype(bool), axis=0)
+                        else:
+                            mask = mask.astype(bool)
+                        if mask.shape != (infer_h, infer_w):
+                            mask = cv2.resize(
+                                mask.astype(np.uint8),
+                                (infer_w, infer_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            ).astype(bool)
+                    if mask is not None and idx < sub_frame_count:
+                        sub_masks[idx] = mask
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] SAM2 points prediction failed: {exc}")
-        sub_masks = [None] * len(sub_frames)
+        sub_masks = [None] * sub_frame_count
 
     cuda_sync()
     if inference_start is None:  # If failure before timing began, treat inference time as 0.
@@ -271,37 +247,46 @@ def _run_points(
 
     # Convert sub_masks dict or list to list for output (None for missing)
     if isinstance(sub_masks, dict):
-        sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frames))]
+        sub_masks_list = [sub_masks.get(i, None) for i in range(sub_frame_count)]
     else:
-        sub_masks_list = [sub_masks[i] if i < len(sub_masks) else None for i in range(len(sub_frames))]
+        sub_masks_list = [sub_masks[i] if i < len(sub_masks) else None for i in range(sub_frame_count)]
     masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
     overlay_path = None
     if out_dir and overlay_name:
         # Persist overlay videos only when requested.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
-        _record_overlays(frames, masks_seq, overlay_path, clip_fps)
+        overlay_video_frames(
+            frames_24fps,
+            masks_seq,
+            output_path=overlay_path,
+            fps=clip_fps,
+            target_hw=full_stream.target_hw,
+        )
 
     try:
         tmp_mp4.unlink(missing_ok=True)
     except OSError:
         pass
 
-    fps = len(sub_frames) / duration
+    fps = sub_frame_count / duration if sub_frame_count else 0.0
+    latency_ms = 1000.0 / fps if fps > 0 else None
     return {
-    "secs": duration,
+        "secs": duration,
         "fps": fps,
-        "latency_ms": 1000.0 / fps,
+        "latency_ms": latency_ms,
         "gpu_peak_alloc": gpu_alloc,
         "gpu_peak_reserved": gpu_reserved,
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": len(frames),
-        "H": height,
-        "W": width,
+        "frames": total_frames,
+        "H": orig_h,
+        "W": orig_w,
+        "infer_H": infer_h,
+        "infer_W": infer_w,
         "num_points": len(points),
-    "setup_ms": round(setup_secs * 1000.0, 2),
+        "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
 
@@ -316,6 +301,7 @@ def _run_bbox(
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
     *,
+    precision=None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
@@ -335,17 +321,27 @@ def _run_bbox(
             "frames": len(frames_24fps),
             "H": 0,
             "W": 0,
+            "infer_H": 0,
+            "infer_W": 0,
         }
 
-    frames = _read_frames(frames_24fps)
-    sub_frames = frames[prompt_frame_idx:]
-    if not sub_frames:
-        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {len(frames)} frames")
-    height, width = sub_frames[0].shape[:2]
+    precision_scope = precision if precision is not None else (lambda: nullcontext())
+
+    total_frames = len(frames_24fps)
+    if prompt_frame_idx >= total_frames:
+        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+
+    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
+    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    infer_h, infer_w = prompt_stream.target_hw
+    orig_h, orig_w = prompt_stream.original_hw
+    print(
+        f"[DEBUG SAM2 {overlay_name or ''}] resolution orig={orig_w}x{orig_h} -> infer={infer_w}x{infer_h}"
+    )
 
     # Persist the subsequence so SAM2VideoPredictor can stream it.
     tmp_mp4 = _temp_video("sam2_bbox_")
-    write_video_mp4(tmp_mp4, sub_frames, clip_fps)
+    write_video_mp4(tmp_mp4, prompt_stream.generator(), clip_fps)
 
     process = psutil.Process()
     reset_gpu_peaks()
@@ -366,6 +362,22 @@ def _run_bbox(
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     mask_indices: List[int] = []
     inference_start: float | None = None
+    sub_frame_count = total_frames - prompt_frame_idx
+
+    scale_x, scale_y = prompt_stream.scale_xy
+    x1, y1, x2, y2 = bbox
+    scaled_x = sorted([x1 * scale_x, x2 * scale_x])
+    scaled_y = sorted([y1 * scale_y, y2 * scale_y])
+    bbox_np = np.array(
+        [
+            np.clip(scaled_x[0], 0, max(0, infer_w - 1)),
+            np.clip(scaled_y[0], 0, max(0, infer_h - 1)),
+            np.clip(scaled_x[1], 0, max(0, infer_w - 1)),
+            np.clip(scaled_y[1], 0, max(0, infer_h - 1)),
+        ],
+        dtype=np.float32,
+    )
+    bbox_list = bbox_np.astype(float).tolist()
     try:
         predictor = _sam2_predictor(overrides)
         _maybe_compile_predictor_model(
@@ -381,71 +393,72 @@ def _run_bbox(
         )
 
         if has_video_api:
-            # Register the box prompt at frame zero before propagation.
-            inference_state = predictor.init_state(str(tmp_mp4))
-            bbox_np = np.array(bbox, dtype=np.float32)
-            predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=0,
-                obj_id=1,
-                box=bbox_np,
-            )
-            inference_start = time.perf_counter()
+            with precision_scope():
+                # Register the box prompt at frame zero before propagation.
+                inference_state = predictor.init_state(str(tmp_mp4))
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=1,
+                    box=bbox_np,
+                )
+                inference_start = time.perf_counter()
 
-            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-                if mask_logits is not None and len(mask_logits) > 0:
-                    mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
-                    if mask.ndim > 2:
-                        mask = np.any(mask, axis=0)
-                    if mask.shape != (height, width):
-                        mask = cv2.resize(
-                            mask.astype(np.uint8),
-                            (width, height),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                    if 0 <= frame_idx < len(sub_masks):
-                        sub_masks[frame_idx] = mask
-                        mask_indices.append(frame_idx)
-                        # Remove oldest if exceeding max_frames_in_mem
-                        if len(mask_indices) > max_frames_in_mem:
-                            oldest = mask_indices.pop(0)
-                            del sub_masks[oldest]
+                for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+                    if mask_logits is not None and len(mask_logits) > 0:
+                        mask = (mask_logits[0] > 0.0).cpu().numpy().astype(bool)
+                        if mask.ndim > 2:
+                            mask = np.any(mask, axis=0)
+                        if mask.shape != (infer_h, infer_w):
+                            mask = cv2.resize(
+                                mask.astype(np.uint8),
+                                (infer_w, infer_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            ).astype(bool)
+                        if 0 <= frame_idx < sub_frame_count:
+                            sub_masks[frame_idx] = mask
+                            mask_indices.append(frame_idx)
+                            # Remove oldest if exceeding max_frames_in_mem
+                            if len(mask_indices) > max_frames_in_mem:
+                                oldest = mask_indices.pop(0)
+                                del sub_masks[oldest]
         else:
             # Fallback for predictor builds exposing only the streaming interface.
-            iterator = None
-            for kwargs in (
-                {"stream": True, "bboxes": [bbox]},
-                {"bboxes": [bbox]},
-                {"stream": True, "boxes": [bbox]},
-                {"boxes": [bbox]},
-            ):
-                try:
-                    iterator = predictor(source=str(tmp_mp4), **kwargs)
-                    break
-                except TypeError:
-                    continue
-            if iterator is None:
-                raise TypeError("SAM2VideoPredictor streaming bbox interface not supported by this build")
-            inference_start = time.perf_counter()
+            with precision_scope():
+                iterator = None
+                for kwargs in (
+                    {"stream": True, "bboxes": [bbox_list]},
+                    {"bboxes": [bbox_list]},
+                    {"stream": True, "boxes": [bbox_list]},
+                    {"boxes": [bbox_list]},
+                ):
+                    try:
+                        iterator = predictor(source=str(tmp_mp4), **kwargs)
+                        break
+                    except TypeError:
+                        continue
+                if iterator is None:
+                    raise TypeError("SAM2VideoPredictor streaming bbox interface not supported by this build")
+                inference_start = time.perf_counter()
 
-            for idx, result in enumerate(iterator):
-                mask = _result_to_mask(result)
-                if mask is not None:
-                    if mask.ndim > 2:
-                        mask = np.any(mask.astype(bool), axis=0)
-                    else:
-                        mask = mask.astype(bool)
-                    if mask.shape != (height, width):
-                        mask = cv2.resize(
-                            mask.astype(np.uint8),
-                            (width, height),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                if mask is not None and idx < len(sub_masks):
-                    sub_masks[idx] = mask
+                for idx, result in enumerate(iterator):
+                    mask = _result_to_mask(result)
+                    if mask is not None:
+                        if mask.ndim > 2:
+                            mask = np.any(mask.astype(bool), axis=0)
+                        else:
+                            mask = mask.astype(bool)
+                        if mask.shape != (infer_h, infer_w):
+                            mask = cv2.resize(
+                                mask.astype(np.uint8),
+                                (infer_w, infer_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            ).astype(bool)
+                    if mask is not None and idx < sub_frame_count:
+                        sub_masks[idx] = mask
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] SAM2 bbox prediction failed: {exc}")
-        sub_masks = [None] * len(sub_frames)
+        sub_masks = [None] * sub_frame_count
 
     cuda_sync()
     if inference_start is None:
@@ -455,34 +468,48 @@ def _run_bbox(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
+    if isinstance(sub_masks, dict):
+        sub_masks_list = [sub_masks.get(i, None) for i in range(sub_frame_count)]
+    else:
+        sub_masks_list = [sub_masks[i] if i < len(sub_masks) else None for i in range(sub_frame_count)]
+    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
 
     overlay_path = None
     if out_dir and overlay_name:
         # Persist overlay videos only when requested.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
-        _record_overlays(frames, masks_seq, overlay_path, clip_fps)
+        overlay_video_frames(
+            frames_24fps,
+            masks_seq,
+            output_path=overlay_path,
+            fps=clip_fps,
+            target_hw=full_stream.target_hw,
+        )
 
     try:
         tmp_mp4.unlink(missing_ok=True)
     except OSError:
         pass
 
-    fps = len(sub_frames) / duration
+    fps = sub_frame_count / duration if sub_frame_count else 0.0
+    latency_ms = 1000.0 / fps if fps > 0 else None
 
     return {
         "secs": duration,
         "fps": fps,
-        "latency_ms": 1000.0 / fps,
+        "latency_ms": latency_ms,
         "gpu_peak_alloc": gpu_alloc,
         "gpu_peak_reserved": gpu_reserved,
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": len(frames),
-        "H": height,
-        "W": width,
+        "frames": total_frames,
+        "H": orig_h,
+        "W": orig_w,
+        "infer_H": infer_h,
+        "infer_W": infer_w,
         "bbox": bbox,
+        "bbox_infer": bbox_list,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
@@ -510,6 +537,7 @@ class SAM2(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
+        precision=None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -524,6 +552,7 @@ class SAM2(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            precision=precision,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
@@ -541,6 +570,7 @@ class SAM2(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
+        precision=None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -555,6 +585,7 @@ class SAM2(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            precision=precision,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,

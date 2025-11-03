@@ -18,7 +18,7 @@ from .runners import edgetam  # noqa: F401  (ensure registration side-effects)
 from .runners import sam2  # noqa: F401
 from .runners.registry import get_runner
 from .synthetic import create_synthetic_test_data
-from .utils import device_str, to_mib
+from .utils import build_precision_context, cleanup_after_run, device_str, reset_gpu_peaks, to_mib
 
 try:
     import torch  # type: ignore[import]
@@ -68,11 +68,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
     parser.add_argument(
-        "--autocast",
+        "--precision",
         type=str,
-        default="bf16",
-        choices=["bf16", "fp16", "none"],
-        help="Enable CUDA autocast with the given dtype (bf16/fp16) or disable (none)",
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Numerical precision for model execution",
     )
     parser.add_argument(
         "--disable_cudnn",
@@ -218,20 +218,6 @@ def _configure_torch(args: argparse.Namespace) -> None:
         torch.set_float32_matmul_precision("high")
     except Exception:  # pragma: no cover
         pass
-    # Configurable global autocast
-    try:
-        if args.autocast == "bf16":
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-            print("Autocast: enabled (cuda, bfloat16)")
-        elif args.autocast == "fp16":
-            torch.autocast(device_type="cuda", dtype=torch.float16).__enter__()
-            print("Autocast: enabled (cuda, float16)")
-        else:
-            print("Autocast: disabled")
-    except Exception as e:  # pragma: no cover
-        print(f"Autocast: not enabled ({e})")
-
-
 def run(args: argparse.Namespace) -> Path:
     split_dir, out_dir = _prepare_dataset(args)
     weights_dir = Path(args.weights_dir)
@@ -242,6 +228,12 @@ def run(args: argparse.Namespace) -> Path:
 
     _configure_torch(args)
     device = device_str()
+    precision_mode = build_precision_context(args.precision, device)
+    if precision_mode.device_type and precision_mode.dtype is not None:
+        dtype_name = str(precision_mode.dtype).split(".")[-1]
+        print(f"Precision: {precision_mode.precision} ({precision_mode.device_type}, {dtype_name})")
+    else:
+        print(f"Precision: {precision_mode.precision}")
 
     video_ids = read_video_ids(split_dir, args.split_name)
     # Apply optional deterministic or random shuffling.
@@ -316,6 +308,7 @@ def run(args: argparse.Namespace) -> Path:
                     out_dir=out_dir if args.save_overlays else None,
                     overlay_name=overlay_name,
                     clip_fps=24.0,
+                    precision=precision_mode,
                     compile_model=args.compile_models,
                     compile_mode=args.compile_mode,
                     compile_backend=args.compile_backend,
@@ -336,6 +329,7 @@ def run(args: argparse.Namespace) -> Path:
                     "object": obj_id,
                     "model": tag,
                     "imgsz": args.imgsz,
+                    "precision": precision_mode.precision,
                     "frames": result.get("frames"),
                     "fps": None if result.get("fps") is None else round(result["fps"], 2),
                     "latency_ms": None if result.get("latency_ms") is None else round(result["latency_ms"], 1),
@@ -345,6 +339,10 @@ def run(args: argparse.Namespace) -> Path:
                     "J": None if j_score is None else round(j_score, 4),
                     "JandF_proxy": None if jf_proxy is None else round(jf_proxy, 4),
                     "overlay": result.get("overlay"),
+                    "input_H": result.get("H"),
+                    "input_W": result.get("W"),
+                    "infer_H": result.get("infer_H"),
+                    "infer_W": result.get("infer_W"),
                 }
                 # Include setup time if provided by runner (e.g., SAM2 separation of build vs inference)
                 if "setup_ms" in result:
@@ -354,6 +352,8 @@ def run(args: argparse.Namespace) -> Path:
                     f"    -> FPS {summary_rows[-1]['fps']}, J {summary_rows[-1]['J']}, "
                     f"mem GPU alloc {summary_rows[-1]['gpu_peak_alloc_MiB']} MiB"
                 )
+                reset_gpu_peaks()
+                cleanup_after_run()
 
         if summary_rows:
             # Overwrite the CSV on each iteration so progress survives interruptions.

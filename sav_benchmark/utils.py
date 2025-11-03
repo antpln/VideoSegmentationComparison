@@ -1,9 +1,12 @@
-"""Utility helpers for device detection and memory bookkeeping."""
+"""Utility helpers for device detection, precision control, and memory housekeeping."""
 
 from __future__ import annotations
 
 import os
-from typing import Any, Optional, Tuple
+from contextlib import nullcontext
+from dataclasses import dataclass
+import gc
+from typing import Any, Callable, Optional, Tuple
 
 try:
     import torch  # type: ignore[import]
@@ -28,9 +31,17 @@ def reset_gpu_peaks() -> None:
     """Reset CUDA peak memory statistics if CUDA is available."""
     if torch is None or not torch.cuda.is_available():
         return
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
+    device_count = torch.cuda.device_count()
+    for idx in range(device_count):
+        try:
+            with torch.cuda.device(idx):
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                if hasattr(torch.cuda, "reset_accumulated_memory_stats"):
+                    torch.cuda.reset_accumulated_memory_stats()  # type: ignore[attr-defined]
+                torch.cuda.empty_cache()
+        except Exception:
+            continue
 
 
 def get_gpu_peaks() -> Tuple[Optional[int], Optional[int]]:
@@ -76,3 +87,74 @@ def maybe_compile_module(
     except Exception as exc:  # pragma: no cover - backend specific
         print(f"[WARN] torch.compile failed: {exc}")
         return module, False
+
+
+def cleanup_after_run() -> None:
+    """Best-effort memory cleanup between inference runs."""
+
+    gc.collect()
+    if torch is None:
+        return
+    try:
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            for idx in range(device_count):
+                try:
+                    with torch.cuda.device(idx):
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        if hasattr(torch.cuda, "reset_accumulated_memory_stats"):
+                            torch.cuda.reset_accumulated_memory_stats()  # type: ignore[attr-defined]
+                except Exception:
+                    continue
+            # Drop any lingering inter-process handles and allocator bookkeeping.
+            if hasattr(torch.cuda, "reset_peak_memory_stats"):
+                torch.cuda.reset_peak_memory_stats()  # type: ignore[attr-defined]
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()  # type: ignore[attr-defined]
+    except Exception:
+        # Cleanup is best-effort; ignore backend-specific failures.
+        pass
+
+
+@dataclass(frozen=True)
+class PrecisionContext:
+    """Factory that yields autocast contexts for the requested precision."""
+
+    precision: str
+    device_type: Optional[str]
+    dtype: Optional[Any]
+
+    def __call__(self) -> Any:
+        if self.device_type is None or self.dtype is None or torch is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device_type, dtype=self.dtype)
+
+
+def build_precision_context(precision: str, device: str) -> PrecisionContext:
+    """Return a reusable precision context factory ensuring hardware support."""
+
+    normalized = precision.lower()
+    if normalized not in {"fp32", "fp16", "bf16"}:
+        raise ValueError(f"Unsupported precision '{precision}'. Choose from fp32, fp16, bf16.")
+
+    if torch is None:
+        if normalized != "fp32":
+            raise ValueError("PyTorch is not available; only fp32 precision is supported.")
+        return PrecisionContext(precision="fp32", device_type=None, dtype=None)
+
+    if normalized == "fp32":
+        return PrecisionContext(precision="fp32", device_type=None, dtype=None)
+
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        raise ValueError(f"Precision '{precision}' requires an available CUDA device.")
+
+    if normalized == "fp16":
+        dtype = torch.float16  # type: ignore[attr-defined]
+    else:  # bf16
+        dtype = torch.bfloat16  # type: ignore[attr-defined]
+        is_supported: Optional[Callable[[], bool]] = getattr(torch.cuda, "is_bf16_supported", None)
+        if callable(is_supported) and not is_supported():
+            raise ValueError("Current CUDA device does not support bfloat16 autocast.")
+
+    return PrecisionContext(precision=normalized, device_type="cuda", dtype=dtype)

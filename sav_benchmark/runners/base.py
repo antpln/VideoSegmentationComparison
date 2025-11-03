@@ -13,8 +13,8 @@ expects a mapping of prompt_type -> callable.
 Each runner method MUST accept the canonical parameter list used elsewhere:
 
     (frames_24fps, prompt_frame_idx, prompt_mask, imgsz, weight_name, device,
-     out_dir=None, overlay_name=None, clip_fps=24.0, compile_model=False,
-     compile_mode="reduce-overhead", compile_backend=None)
+     out_dir=None, overlay_name=None, clip_fps=24.0, *, precision=None,
+     compile_model=False, compile_mode="reduce-overhead", compile_backend=None)
 
 and return the standard result dictionary.
 
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from abc import ABC
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
@@ -58,6 +58,7 @@ class Model(ABC):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
+        precision: Any = None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -76,6 +77,7 @@ class Model(ABC):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
+        precision: Any = None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
