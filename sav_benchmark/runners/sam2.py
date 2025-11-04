@@ -179,6 +179,7 @@ def _run_points(
 
     scale_x, scale_y = prompt_stream.scale_xy
     pad_x, pad_y = prompt_stream.pad_offsets()
+    content_h, content_w = prompt_stream.content_shape()
     points_np = np.array([[p[0] * scale_x, p[1] * scale_y] for p in points], dtype=np.float32)
     points_np[:, 0] = np.clip(points_np[:, 0] + pad_x, 0, max(0, infer_w - 1))
     points_np[:, 1] = np.clip(points_np[:, 1] + pad_y, 0, max(0, infer_h - 1))
@@ -320,6 +321,12 @@ def _run_points(
         "infer_H": infer_h,
         "infer_W": infer_w,
         "num_points": len(points),
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+        "content_H": content_h,
+        "content_W": content_w,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
@@ -565,6 +572,12 @@ def _run_bbox(
         "processed_end_frame": clip_end,
         "bbox": bbox,
         "bbox_infer": bbox_list,
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+        "content_H": content_h,
+        "content_W": content_w,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 

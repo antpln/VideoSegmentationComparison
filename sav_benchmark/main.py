@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
+import cv2  # type: ignore[import]
 
 from .data_io import ensure_dir, list_annotated_indices_6fps, list_frames_24fps, load_mask_png, read_video_ids
 from .metrics import j_and_proxy_jf
@@ -224,6 +225,39 @@ def _configure_torch(args: argparse.Namespace) -> None:
         torch.set_float32_matmul_precision("high")
     except Exception:  # pragma: no cover
         pass
+
+
+def _restore_mask_to_original(mask: Optional[np.ndarray], result: Dict[str, object]) -> Optional[np.ndarray]:
+    if mask is None:
+        return None
+
+    mask_np = np.asarray(mask).astype(bool)
+    orig_h = int(result.get("H") or mask_np.shape[0])
+    orig_w = int(result.get("W") or mask_np.shape[1])
+
+    content_h = int(result.get("content_H") or mask_np.shape[0])
+    content_w = int(result.get("content_W") or mask_np.shape[1])
+    pad_x = int(result.get("pad_x") or 0)
+    pad_y = int(result.get("pad_y") or 0)
+
+    y0 = max(0, min(pad_y, mask_np.shape[0]))
+    y1 = max(0, min(pad_y + content_h, mask_np.shape[0]))
+    x0 = max(0, min(pad_x, mask_np.shape[1]))
+    x1 = max(0, min(pad_x + content_w, mask_np.shape[1]))
+
+    if y1 > y0 and x1 > x0:
+        cropped = mask_np[y0:y1, x0:x1]
+    else:
+        cropped = mask_np
+
+    resized = cv2.resize(
+        cropped.astype(np.uint8),
+        (orig_w, orig_h),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return resized.astype(bool)
+
+
 def run(args: argparse.Namespace) -> Path:
     split_dir, out_dir = _prepare_dataset(args)
     weights_dir = Path(args.weights_dir)
@@ -339,10 +373,12 @@ def run(args: argparse.Namespace) -> Path:
                     if mask_sequence is None or frame_idx >= len(mask_sequence) or frame_idx < 0:
                         predicted_masks.append(None)
                     else:
-                        predicted_masks.append(mask_sequence[frame_idx])
+                        predicted_masks.append(
+                            _restore_mask_to_original(mask_sequence[frame_idx], result)
+                        )
                     gt_eval_masks.append(gt_mask_map.get(frame_idx))
 
-                j_score, jf_proxy = j_and_proxy_jf(predicted_masks, gt_eval_masks)
+                j_score, f_score = j_and_proxy_jf(predicted_masks, gt_eval_masks)
 
                 row = {
                     "video": video_id,
@@ -358,7 +394,8 @@ def run(args: argparse.Namespace) -> Path:
                     "gpu_peak_reserved_MiB": to_mib(result.get("gpu_peak_reserved")),
                     "cpu_peak_rss_MiB": to_mib(result.get("cpu_peak_rss")),
                     "J": None if j_score is None else round(j_score, 4),
-                    "JandF_proxy": None if jf_proxy is None else round(jf_proxy, 4),
+                    "F": None if f_score is None else round(f_score, 4),
+                    "JandF": None if (j_score is None or f_score is None) else round((j_score + f_score) / 2.0, 4),
                     "overlay": result.get("overlay"),
                     "input_H": result.get("H"),
                     "input_W": result.get("W"),
@@ -370,7 +407,7 @@ def run(args: argparse.Namespace) -> Path:
                     row["setup_ms"] = result["setup_ms"]
                 summary_rows.append(row)
                 print(
-                    f"    -> FPS {summary_rows[-1]['fps']}, J {summary_rows[-1]['J']}, "
+                    f"    -> FPS {summary_rows[-1]['fps']}, J {summary_rows[-1]['J']}, F {summary_rows[-1]['F']}, "
                     f"mem GPU alloc {summary_rows[-1]['gpu_peak_alloc_MiB']} MiB"
                 )
                 reset_gpu_peaks()

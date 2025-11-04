@@ -269,6 +269,8 @@ def _run_points(
     orig_height, orig_width = prompt_stream.original_hw
     scale_x, scale_y = prompt_stream.scale_xy
     pad_x, pad_y = prompt_stream.pad_offsets()
+    content_h, content_w = prompt_stream.content_shape()
+    content_h, content_w = prompt_stream.content_shape()
     precision_scope = precision if precision is not None else (lambda: nullcontext())
 
     # Fairness alignment with SAM2: start GPU peak tracking BEFORE predictor build
@@ -522,6 +524,12 @@ def _run_points(
         "infer_W": width,
         "processed_end_frame": clip_end,
         "num_points": len(points),  # will be 1 under the single-point policy
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+        "content_H": content_h,
+        "content_W": content_w,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 
@@ -783,6 +791,12 @@ def _run_bbox(
         "bbox": bbox,
         "bbox_infer": bbox_list,
         "processed_end_frame": clip_end,
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+        "content_H": content_h,
+        "content_W": content_w,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 

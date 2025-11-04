@@ -79,6 +79,9 @@ class FrameStream:
         pad_top, _, pad_left, _ = self.pad_hw
         return pad_left, pad_top
 
+    def content_shape(self) -> Tuple[int, int]:
+        return self.content_hw
+
 
 def _compute_target_hw(
     original_hw: Tuple[int, int],
