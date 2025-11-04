@@ -65,6 +65,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="reduce-overhead",
         help="torch.compile mode (e.g., default, reduce-overhead, max-autotune)",
     )
+    parser.add_argument(
+        "--max_clip_frames",
+        type=int,
+        default=0,
+        help="Process at most this many frames after the prompt (0 = full video)",
+    )
     parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
     parser.add_argument(
@@ -309,6 +315,7 @@ def run(args: argparse.Namespace) -> Path:
                     overlay_name=overlay_name,
                     clip_fps=24.0,
                     precision=precision_mode,
+                    max_clip_frames=args.max_clip_frames,
                     compile_model=args.compile_models,
                     compile_mode=args.compile_mode,
                     compile_backend=args.compile_backend,

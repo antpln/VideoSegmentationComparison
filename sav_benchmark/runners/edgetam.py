@@ -189,6 +189,7 @@ def _run_points(
     num_points: int = 5,
     *,
     precision=None,
+    max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
@@ -220,7 +221,11 @@ def _run_points(
     if prompt_frame_idx >= total_frames:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
-    sub_frame_paths = frames_24fps[prompt_frame_idx:]
+    clip_end = total_frames
+    if max_clip_frames is not None and max_clip_frames > 0:
+        clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
+
+    sub_frame_paths = frames_24fps[prompt_frame_idx:clip_end]
     sub_frame_count = len(sub_frame_paths)
     if sub_frame_count == 0:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
@@ -230,14 +235,16 @@ def _run_points(
     if safe_imgsz is not None:
         inference_hw = (safe_imgsz, safe_imgsz)
 
+    clipped_paths = frames_24fps[:clip_end]
+
     full_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         imgsz=imgsz,
         target_hw=inference_hw,
         force_square=True,
     )
     prompt_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         start_idx=prompt_frame_idx,
         imgsz=imgsz,
         target_hw=inference_hw,
@@ -443,8 +450,8 @@ def _run_points(
         # Persist overlays only on demand.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
         overlay_video_frames(
-            frames_24fps,
-            masks_seq,
+            clipped_paths,
+            masks_seq[:clip_end],
             output_path=overlay_path,
             fps=clip_fps,
             target_hw=full_stream.target_hw,
@@ -469,7 +476,7 @@ def _run_points(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": total_frames,
+        "frames": clip_end - prompt_frame_idx,
         "H": orig_height,
         "W": orig_width,
         "infer_H": height,
@@ -532,7 +539,12 @@ def _run_bbox(
     total_frames = len(frames_24fps)
     if prompt_frame_idx >= total_frames:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
-    sub_frame_paths = frames_24fps[prompt_frame_idx:]
+
+    clip_end = total_frames
+    if max_clip_frames is not None and max_clip_frames > 0:
+        clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
+
+    sub_frame_paths = frames_24fps[prompt_frame_idx:clip_end]
     sub_frame_count = len(sub_frame_paths)
     if sub_frame_count == 0:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
@@ -542,14 +554,16 @@ def _run_bbox(
     if safe_imgsz is not None:
         inference_hw = (safe_imgsz, safe_imgsz)
 
+    clipped_paths = frames_24fps[:clip_end]
+
     full_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         imgsz=imgsz,
         target_hw=inference_hw,
         force_square=True,
     )
     prompt_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         start_idx=prompt_frame_idx,
         imgsz=imgsz,
         target_hw=inference_hw,
@@ -666,8 +680,8 @@ def _run_bbox(
         # Persist overlays only on demand.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
         overlay_video_frames(
-            frames_24fps,
-            masks_seq,
+            clipped_paths,
+            masks_seq[:clip_end],
             output_path=overlay_path,
             fps=clip_fps,
             target_hw=full_stream.target_hw,
@@ -693,7 +707,7 @@ def _run_bbox(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": total_frames,
+        "frames": clip_end - prompt_frame_idx,
         "H": orig_height,
         "W": orig_width,
         "infer_H": height,
@@ -724,6 +738,7 @@ class EdgeTAM(Model):
         num_points: int = 5,
         *,
         precision=None,
+        max_clip_frames: Optional[int] = None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -740,6 +755,7 @@ class EdgeTAM(Model):
             clip_fps=clip_fps,
             num_points=num_points,
             precision=precision,
+            max_clip_frames=max_clip_frames,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
@@ -758,6 +774,7 @@ class EdgeTAM(Model):
         clip_fps: float = 24.0,
         *,
         precision=None,
+        max_clip_frames: Optional[int] = None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -773,6 +790,7 @@ class EdgeTAM(Model):
             overlay_name=overlay_name,
             clip_fps=clip_fps,
             precision=precision,
+            max_clip_frames=max_clip_frames,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,

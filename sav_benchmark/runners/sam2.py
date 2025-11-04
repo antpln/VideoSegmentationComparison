@@ -91,6 +91,7 @@ def _run_points(
     num_points: int = 5,
     *,
     precision=None,
+    max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
@@ -120,15 +121,21 @@ def _run_points(
     if prompt_frame_idx >= total_frames:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
+    clip_end = total_frames
+    if max_clip_frames is not None and max_clip_frames > 0:
+        clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
+
+    clipped_paths = frames_24fps[:clip_end]
+
     square_override = _square_override(imgsz)
     full_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         imgsz=imgsz,
         target_hw=square_override,
         force_square=True,
     )
     prompt_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         start_idx=prompt_frame_idx,
         imgsz=imgsz,
         target_hw=square_override,
@@ -142,7 +149,11 @@ def _run_points(
 
     # SAM2 expects a video file; write the subsequence to a temporary mp4 using a generator.
     tmp_mp4 = _temp_video("sam2_points_")
-    write_video_mp4(tmp_mp4, prompt_stream.generator(), clip_fps)
+    write_video_mp4(
+        tmp_mp4,
+        prompt_stream.generator(),
+        clip_fps,
+    )
 
     process = psutil.Process()
     reset_gpu_peaks()
@@ -164,7 +175,7 @@ def _run_points(
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     mask_indices: List[int] = []
     inference_start: float | None = None
-    sub_frame_count = total_frames - prompt_frame_idx
+    sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
     points_np = np.array([[p[0] * scale_x, p[1] * scale_y] for p in points], dtype=np.float32)
@@ -278,8 +289,8 @@ def _run_points(
         # Persist overlay videos only when requested.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
         overlay_video_frames(
-            frames_24fps,
-            masks_seq,
+            clipped_paths[prompt_frame_idx:clip_end],
+            masks_seq[prompt_frame_idx:clip_end],
             output_path=overlay_path,
             fps=clip_fps,
             target_hw=full_stream.target_hw,
@@ -301,7 +312,7 @@ def _run_points(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": total_frames,
+        "frames": clip_end - prompt_frame_idx,
         "H": orig_h,
         "W": orig_w,
         "infer_H": infer_h,
@@ -323,6 +334,7 @@ def _run_bbox(
     clip_fps: float = 24.0,
     *,
     precision=None,
+    max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
@@ -352,15 +364,21 @@ def _run_bbox(
     if prompt_frame_idx >= total_frames:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
+    clip_end = total_frames
+    if max_clip_frames is not None and max_clip_frames > 0:
+        clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
+
+    clipped_paths = frames_24fps[:clip_end]
+
     square_override = _square_override(imgsz)
     full_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         imgsz=imgsz,
         target_hw=square_override,
         force_square=True,
     )
     prompt_stream = prepare_frame_stream(
-        frames_24fps,
+        clipped_paths,
         start_idx=prompt_frame_idx,
         imgsz=imgsz,
         target_hw=square_override,
@@ -395,7 +413,7 @@ def _run_bbox(
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     mask_indices: List[int] = []
     inference_start: float | None = None
-    sub_frame_count = total_frames - prompt_frame_idx
+    sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
     x1, y1, x2, y2 = bbox
@@ -512,8 +530,8 @@ def _run_bbox(
         # Persist overlay videos only when requested.
         overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
         overlay_video_frames(
-            frames_24fps,
-            masks_seq,
+            clipped_paths,
+            masks_seq[:clip_end],
             output_path=overlay_path,
             fps=clip_fps,
             target_hw=full_stream.target_hw,
@@ -536,7 +554,7 @@ def _run_bbox(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": total_frames,
+        "frames": clip_end - prompt_frame_idx,
         "H": orig_h,
         "W": orig_w,
         "infer_H": infer_h,
@@ -571,6 +589,7 @@ class SAM2(Model):
         clip_fps: float = 24.0,
         *,
         precision=None,
+        max_clip_frames: Optional[int] = None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -586,6 +605,7 @@ class SAM2(Model):
             overlay_name=overlay_name,
             clip_fps=clip_fps,
             precision=precision,
+            max_clip_frames=max_clip_frames,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
@@ -604,6 +624,7 @@ class SAM2(Model):
         clip_fps: float = 24.0,
         *,
         precision=None,
+        max_clip_frames: Optional[int] = None,
         compile_model: bool = False,
         compile_mode: str | None = "reduce-overhead",
         compile_backend: str | None = None,
@@ -619,6 +640,7 @@ class SAM2(Model):
             overlay_name=overlay_name,
             clip_fps=clip_fps,
             precision=precision,
+            max_clip_frames=max_clip_frames,
             compile_model=compile_model,
             compile_mode=compile_mode,
             compile_backend=compile_backend,
