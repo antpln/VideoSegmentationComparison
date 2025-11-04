@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover - EdgeTAM optional
 
 from ..prompts import extract_bbox_from_mask, extract_points_from_mask
 from .base import Model
-from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
+from ..utils import cleanup_after_run, cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_video_frames, prepare_frame_stream
 
 
@@ -73,6 +73,20 @@ def _gpu_debug_snapshot(stage: str) -> None:
             print(f"[DEBUG cuda {stage}] dev={dev} {name} alloc={allocated:.2f}G resv={reserved:.2f}G max_alloc={max_alloc:.2f}G max_resv={max_res:.2f}G{free_str}")
     except Exception:
         pass
+
+
+_RETRYABLE_CUDA_PATTERNS = (
+    "CUDACachingAllocator",
+    "NvMapMem",
+    "NVML_SUCCESS",
+)
+
+_MAX_CUDA_RETRIES = 3
+
+
+def _should_retry_cuda_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(token in message for token in _RETRYABLE_CUDA_PATTERNS)
 
 
 def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optional[int] = None, compile_image_encoder: bool = False) -> object:
@@ -194,6 +208,7 @@ def _run_points(
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
     max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
+    _attempt: int = 1,
 ) -> Dict[str, object]:
     _ = ()
     # Translate the mask into positive point prompts.
@@ -423,7 +438,30 @@ def _run_points(
             f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks_list)}"
         )
     except Exception as exc:  # pragma: no cover
-        print(f"[ERROR] EdgeTAM points inference failed: {exc}")
+        if _should_retry_cuda_error(exc) and _attempt < _MAX_CUDA_RETRIES:
+            print(
+                f"[WARN EdgeTAM] points inference attempt {_attempt} failed with allocator error: {exc}. Retrying."
+            )
+            cleanup_after_run()
+            return _run_points(
+                frames_24fps=frames_24fps,
+                prompt_frame_idx=prompt_frame_idx,
+                prompt_mask=prompt_mask,
+                imgsz=imgsz,
+                weight_name=weight_name,
+                device=device,
+                out_dir=out_dir,
+                overlay_name=overlay_name,
+                clip_fps=clip_fps,
+                precision=precision,
+                max_clip_frames=max_clip_frames,
+                compile_model=compile_model,
+                compile_mode=compile_mode,
+                compile_backend=compile_backend,
+                max_frames_in_mem=max_frames_in_mem,
+                _attempt=_attempt + 1,
+            )
+        print(f"[ERROR] EdgeTAM points inference failed (attempt {_attempt}): {exc}")
         print(traceback.format_exc())
         sub_masks_list = [None] * sub_frame_count
         if inference_start is None:
@@ -499,10 +537,13 @@ def _run_bbox(
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
     *,
+    precision=None,
+    max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
     max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
+    _attempt: int = 1,
 ) -> Dict[str, object]:
     _ = (imgsz, device)
     bbox = extract_bbox_from_mask(prompt_mask)
@@ -658,7 +699,31 @@ def _run_bbox(
                 if 0 <= frame_idx < sub_frame_count:
                     sub_masks[frame_idx] = mask_np
     except Exception as exc:  # pragma: no cover
-        print(f"[ERROR] EdgeTAM bbox inference failed: {exc}")
+        if _should_retry_cuda_error(exc) and _attempt < _MAX_CUDA_RETRIES:
+            print(
+                f"[WARN EdgeTAM] bbox inference attempt {_attempt} failed with allocator error: {exc}. Retrying."
+            )
+            cleanup_after_run()
+            return _run_bbox(
+                frames_24fps=frames_24fps,
+                prompt_frame_idx=prompt_frame_idx,
+                prompt_mask=prompt_mask,
+                imgsz=imgsz,
+                weight_name=weight_name,
+                device=device,
+                out_dir=out_dir,
+                overlay_name=overlay_name,
+                clip_fps=clip_fps,
+                precision=precision,
+                max_clip_frames=max_clip_frames,
+                compile_model=compile_model,
+                compile_mode=compile_mode,
+                compile_backend=compile_backend,
+                max_frames_in_mem=max_frames_in_mem,
+                _attempt=_attempt + 1,
+            )
+        print(f"[ERROR] EdgeTAM bbox inference failed (attempt {_attempt}): {exc}")
+        print(traceback.format_exc())
         sub_masks = [None] * sub_frame_count
         if inference_start is None:
             inference_start = time.perf_counter()
