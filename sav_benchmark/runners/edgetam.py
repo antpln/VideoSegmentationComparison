@@ -30,6 +30,15 @@ from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module,
 from ..video_ops import overlay_video_frames, prepare_frame_stream
 
 
+def _safe_image_size(image_size: Optional[int]) -> Optional[int]:
+    if image_size is None:
+        return None
+    safe = max(64, int(round(int(image_size) / 64) * 64))
+    if safe % 2 != 0:
+        safe += 1
+    return safe
+
+
 def _find_existing(paths: List[str]) -> Optional[Path]:
     """Return the first existing path from the provided candidate list."""
     for candidate in paths:
@@ -99,10 +108,12 @@ def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optio
     hydra_overrides_extra = []
     if image_size is not None:
         # EdgeTAM config assumes image_size divisible by 64 (e.g., 1024 -> grids 64,16).
-        safe_imgsz = max(64, int(round(int(image_size) / 64) * 64))
+        safe_imgsz = _safe_image_size(image_size)
+        if safe_imgsz is None:
+            safe_imgsz = image_size
         if safe_imgsz != int(image_size):
             print(f"[WARN EdgeTAM] Adjusting image_size from {image_size} to nearest multiple-of-64: {safe_imgsz}")
-        
+
         # Override image_size and corresponding RoPE attention sizes
         # feat_sizes for self-attention: stride-32 features = image_size / 32
         # q_sizes for cross-attention: stride-16 features = image_size / 16
@@ -214,8 +225,24 @@ def _run_points(
     if sub_frame_count == 0:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
-    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
-    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    safe_imgsz = _safe_image_size(imgsz)
+    inference_hw = None
+    if safe_imgsz is not None:
+        inference_hw = (safe_imgsz, safe_imgsz)
+
+    full_stream = prepare_frame_stream(
+        frames_24fps,
+        imgsz=imgsz,
+        target_hw=inference_hw,
+        force_square=True,
+    )
+    prompt_stream = prepare_frame_stream(
+        frames_24fps,
+        start_idx=prompt_frame_idx,
+        imgsz=imgsz,
+        target_hw=inference_hw,
+        force_square=True,
+    )
     height, width = prompt_stream.target_hw
     orig_height, orig_width = prompt_stream.original_hw
     scale_x, scale_y = prompt_stream.scale_xy
@@ -510,11 +537,28 @@ def _run_bbox(
     if sub_frame_count == 0:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
-    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
-    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    safe_imgsz = _safe_image_size(imgsz)
+    inference_hw = None
+    if safe_imgsz is not None:
+        inference_hw = (safe_imgsz, safe_imgsz)
+
+    full_stream = prepare_frame_stream(
+        frames_24fps,
+        imgsz=imgsz,
+        target_hw=inference_hw,
+        force_square=True,
+    )
+    prompt_stream = prepare_frame_stream(
+        frames_24fps,
+        start_idx=prompt_frame_idx,
+        imgsz=imgsz,
+        target_hw=inference_hw,
+        force_square=True,
+    )
     height, width = prompt_stream.target_hw
     orig_height, orig_width = prompt_stream.original_hw
     scale_x, scale_y = prompt_stream.scale_xy
+    precision_scope = precision if precision is not None else (lambda: nullcontext())
 
     # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
     temp_dir = Path(out_dir) / f"__tmp_edgetam_bbox_{overlay_name or 'clip'}_frames" if out_dir else Path("__tmp_edgetam_bbox_frames")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2  # type: ignore[import]
 import numpy as np
@@ -21,6 +21,15 @@ from ..prompts import extract_bbox_from_mask, extract_points_from_mask
 from .base import Model
 from ..utils import cuda_sync, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_video_frames, prepare_frame_stream, write_video_mp4
+
+
+def _square_override(imgsz: Optional[int]) -> Optional[Tuple[int, int]]:
+    if imgsz is None or imgsz <= 0:
+        return None
+    side = int(imgsz)
+    if side % 2 != 0:
+        side += 1
+    return side, side
 
 
 def _temp_video(prefix: str) -> Path:
@@ -111,8 +120,20 @@ def _run_points(
     if prompt_frame_idx >= total_frames:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
-    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
-    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    square_override = _square_override(imgsz)
+    full_stream = prepare_frame_stream(
+        frames_24fps,
+        imgsz=imgsz,
+        target_hw=square_override,
+        force_square=True,
+    )
+    prompt_stream = prepare_frame_stream(
+        frames_24fps,
+        start_idx=prompt_frame_idx,
+        imgsz=imgsz,
+        target_hw=square_override,
+        force_square=True,
+    )
     infer_h, infer_w = prompt_stream.target_hw
     orig_h, orig_w = prompt_stream.original_hw
     print(
@@ -331,8 +352,20 @@ def _run_bbox(
     if prompt_frame_idx >= total_frames:
         raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
 
-    full_stream = prepare_frame_stream(frames_24fps, imgsz=imgsz)
-    prompt_stream = prepare_frame_stream(frames_24fps, start_idx=prompt_frame_idx, imgsz=imgsz)
+    square_override = _square_override(imgsz)
+    full_stream = prepare_frame_stream(
+        frames_24fps,
+        imgsz=imgsz,
+        target_hw=square_override,
+        force_square=True,
+    )
+    prompt_stream = prepare_frame_stream(
+        frames_24fps,
+        start_idx=prompt_frame_idx,
+        imgsz=imgsz,
+        target_hw=square_override,
+        force_square=True,
+    )
     infer_h, infer_w = prompt_stream.target_hw
     orig_h, orig_w = prompt_stream.original_hw
     print(

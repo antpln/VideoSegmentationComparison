@@ -57,27 +57,46 @@ class FrameStream:
         )
 
 
-def _compute_target_hw(original_hw: Tuple[int, int], imgsz: Optional[int]) -> Tuple[int, int]:
+def _compute_target_hw(
+    original_hw: Tuple[int, int],
+    imgsz: Optional[int],
+    override_hw: Optional[Tuple[int, int]] = None,
+    *,
+    force_square: bool = False,
+) -> Tuple[int, int]:
     """Return the (H, W) resize target honoring aspect ratio and max dimension."""
 
-    if imgsz is None or imgsz <= 0:
-        return original_hw
+    if override_hw is not None:
+        target_h, target_w = override_hw
+        target_h = max(1, int(target_h))
+        target_w = max(1, int(target_w))
+    else:
+        if imgsz is None or imgsz <= 0:
+            target_h, target_w = original_hw
+        else:
+            max_dim = max(original_hw)
+            if imgsz >= max_dim:
+                target_h, target_w = original_hw
+            else:
+                scale = imgsz / float(max_dim)
+                target_h = max(1, int(round(original_hw[0] * scale)))
+                target_w = max(1, int(round(original_hw[1] * scale)))
 
-    max_dim = max(original_hw)
-    if imgsz >= max_dim:
-        return original_hw
-
-    scale = imgsz / float(max_dim)
-    target_h = max(1, int(round(original_hw[0] * scale)))
-    target_w = max(1, int(round(original_hw[1] * scale)))
+    if force_square:
+        side = max(target_h, target_w)
+        target_h = target_w = side
 
     # Ensure even dimensions for H.264 writers.
-    if target_h % 2 != 0:
-        target_h += 1
-    if target_w % 2 != 0:
-        target_w += 1
+    target_h = _ensure_even(target_h)
+    target_w = _ensure_even(target_w)
 
     return target_h, target_w
+
+
+def _ensure_even(value: int) -> int:
+    if value % 2 != 0:
+        value += 1
+    return value
 
 
 def prepare_frame_stream(
@@ -86,6 +105,8 @@ def prepare_frame_stream(
     start_idx: int = 0,
     imgsz: Optional[int] = None,
     interpolation: int = cv2.INTER_LINEAR,
+    target_hw: Optional[Tuple[int, int]] = None,
+    force_square: bool = False,
 ) -> FrameStream:
     """Create a ``FrameStream`` starting at ``start_idx`` with optional resizing."""
 
@@ -98,7 +119,12 @@ def prepare_frame_stream(
         raise FileNotFoundError(f"Could not read frame {first_path}")
 
     original_hw = first_frame.shape[:2]
-    target_hw = _compute_target_hw(original_hw, imgsz)
+    target_hw = _compute_target_hw(
+        original_hw,
+        imgsz,
+        override_hw=target_hw,
+        force_square=force_square,
+    )
 
     return FrameStream(
         frame_paths=frame_paths,
