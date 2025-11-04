@@ -290,6 +290,7 @@ def run(args: argparse.Namespace) -> Path:
                 gt_path = split_dir / "Annotations_6fps" / video_id / obj_id / f"{frame_idx:05d}.png"
                 gt_mask = load_mask_png(gt_path)
                 gt_masks.append(gt_mask)
+            gt_mask_map = {idx: mask for idx, mask in zip(frame_indices, gt_masks)}
 
             for tag, weight_name in models:
                 try:
@@ -321,15 +322,27 @@ def run(args: argparse.Namespace) -> Path:
                     compile_backend=args.compile_backend,
                 )
 
-                predicted_masks: List[Optional[np.ndarray]] = []
-                if result.get("masks_seq") is None:
-                    predicted_masks = [None] * len(gt_masks)
-                else:
-                    mask_sequence = result["masks_seq"]
-                    for frame_idx in frame_indices:
-                        predicted_masks.append(mask_sequence[frame_idx] if 0 <= frame_idx < len(mask_sequence) else None)
+                processed_end = result.get("processed_end_frame")
+                scored_indices = [
+                    idx
+                    for idx in frame_indices
+                    if processed_end is None or processed_end == 0 or idx < processed_end
+                ]
+                if not scored_indices:
+                    print("    -> No frames selected for metric evaluation (clip truncated before annotations).")
+                    continue
 
-                j_score, jf_proxy = j_and_proxy_jf(predicted_masks, gt_masks)
+                predicted_masks: List[Optional[np.ndarray]] = []
+                gt_eval_masks: List[Optional[np.ndarray]] = []
+                mask_sequence = result.get("masks_seq")
+                for frame_idx in scored_indices:
+                    if mask_sequence is None or frame_idx >= len(mask_sequence) or frame_idx < 0:
+                        predicted_masks.append(None)
+                    else:
+                        predicted_masks.append(mask_sequence[frame_idx])
+                    gt_eval_masks.append(gt_mask_map.get(frame_idx))
+
+                j_score, jf_proxy = j_and_proxy_jf(predicted_masks, gt_eval_masks)
 
                 row = {
                     "video": video_id,
@@ -338,6 +351,7 @@ def run(args: argparse.Namespace) -> Path:
                     "imgsz": args.imgsz,
                     "precision": precision_mode.precision,
                     "frames": result.get("frames"),
+                    "processed_end_frame": processed_end,
                     "fps": None if result.get("fps") is None else round(result["fps"], 2),
                     "latency_ms": None if result.get("latency_ms") is None else round(result["latency_ms"], 1),
                     "gpu_peak_alloc_MiB": to_mib(result.get("gpu_peak_alloc")),

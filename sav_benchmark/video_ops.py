@@ -12,24 +12,47 @@ import numpy as np
 
 @dataclass
 class FrameStream:
-    """Streaming view over frames with optional resizing."""
+    """Streaming view over frames with optional resizing and optional square padding."""
 
     frame_paths: Sequence[Path]
     start_idx: int
     target_hw: Tuple[int, int]
     original_hw: Tuple[int, int]
+    content_hw: Tuple[int, int]
+    pad_hw: Tuple[int, int, int, int]  # top, bottom, left, right
+    scale_values: Tuple[float, float]
     interpolation: int = cv2.INTER_LINEAR
 
     def generator(self) -> Iterator[np.ndarray]:
         """Yield frames at the configured inference resolution."""
+        content_h, content_w = self.content_hw
+        pad_top, pad_bottom, pad_left, pad_right = self.pad_hw
+        target_h, target_w = self.target_hw
+
         for offset, path in enumerate(self.frame_paths[self.start_idx:]):
             frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if frame is None:
                 raise FileNotFoundError(f"Could not read frame {path}")
-            if self.target_hw != self.original_hw:
+            if (content_h, content_w) != self.original_hw:
                 frame = cv2.resize(
                     frame,
-                    (self.target_hw[1], self.target_hw[0]),
+                    (content_w, content_h),
+                    interpolation=self.interpolation,
+                )
+            if any(self.pad_hw):
+                frame = cv2.copyMakeBorder(
+                    frame,
+                    pad_top,
+                    pad_bottom,
+                    pad_left,
+                    pad_right,
+                    cv2.BORDER_CONSTANT,
+                    value=0,
+                )
+            if frame.shape[0] != target_h or frame.shape[1] != target_w:
+                frame = cv2.resize(
+                    frame,
+                    (target_w, target_h),
                     interpolation=self.interpolation,
                 )
             if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
@@ -48,13 +71,13 @@ class FrameStream:
 
     @property
     def scale_xy(self) -> Tuple[float, float]:
-        """Return (scale_x, scale_y) used to map original -> inference coords."""
-        if self.original_hw[1] == 0 or self.original_hw[0] == 0:
-            return 1.0, 1.0
-        return (
-            self.target_hw[1] / float(self.original_hw[1]),
-            self.target_hw[0] / float(self.original_hw[0]),
-        )
+        """Return (scale_x, scale_y) used to map original -> inference coords (before padding)."""
+        return self.scale_values
+
+    def pad_offsets(self) -> Tuple[int, int]:
+        """Return (pad_x, pad_y) offsets applied after resizing (left, top)."""
+        pad_top, _, pad_left, _ = self.pad_hw
+        return pad_left, pad_top
 
 
 def _compute_target_hw(
@@ -126,11 +149,41 @@ def prepare_frame_stream(
         force_square=force_square,
     )
 
+    target_h, target_w = target_hw
+    original_h, original_w = original_hw
+
+    pad_top = pad_bottom = pad_left = pad_right = 0
+    content_h, content_w = target_h, target_w
+    scale_x = target_w / float(original_w)
+    scale_y = target_h / float(original_h)
+
+    if force_square:
+        side = target_h  # same as target_w when force_square
+        ratio = min(side / float(original_h), side / float(original_w))
+        content_h = max(1, int(round(original_h * ratio)))
+        content_w = max(1, int(round(original_w * ratio)))
+        content_h = min(side, _ensure_even(content_h))
+        content_w = min(side, _ensure_even(content_w))
+
+        pad_top = max(0, (side - content_h) // 2)
+        pad_bottom = max(0, side - content_h - pad_top)
+        pad_left = max(0, (side - content_w) // 2)
+        pad_right = max(0, side - content_w - pad_left)
+
+        scale_x = content_w / float(original_w)
+        scale_y = content_h / float(original_h)
+
+    scale_values = (scale_x, scale_y)
+    pad_hw = (pad_top, pad_bottom, pad_left, pad_right)
+
     return FrameStream(
         frame_paths=frame_paths,
         start_idx=start_idx,
         target_hw=target_hw,
         original_hw=original_hw,
+        content_hw=(content_h, content_w),
+        pad_hw=pad_hw,
+        scale_values=scale_values,
         interpolation=interpolation,
     )
 

@@ -253,6 +253,7 @@ def _run_points(
     height, width = prompt_stream.target_hw
     orig_height, orig_width = prompt_stream.original_hw
     scale_x, scale_y = prompt_stream.scale_xy
+    pad_x, pad_y = prompt_stream.pad_offsets()
     precision_scope = precision if precision is not None else (lambda: nullcontext())
 
     # Fairness alignment with SAM2: start GPU peak tracking BEFORE predictor build
@@ -332,7 +333,7 @@ def _run_points(
         raise
 
     try:
-        points_np = np.array([[p[0] * scale_x, p[1] * scale_y] for p in points], dtype=np.float32)
+        points_np = np.array([[p[0] * scale_x + pad_x, p[1] * scale_y + pad_y] for p in points], dtype=np.float32)
         points_np[:, 0] = np.clip(points_np[:, 0], 0, max(0, width - 1))
         points_np[:, 1] = np.clip(points_np[:, 1], 0, max(0, height - 1))
         labels_np = np.array(labels, dtype=np.int32)
@@ -481,6 +482,7 @@ def _run_points(
         "W": orig_width,
         "infer_H": height,
         "infer_W": width,
+        "processed_end_frame": clip_end,
         "num_points": len(points),  # will be 1 under the single-point policy
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
@@ -572,6 +574,7 @@ def _run_bbox(
     height, width = prompt_stream.target_hw
     orig_height, orig_width = prompt_stream.original_hw
     scale_x, scale_y = prompt_stream.scale_xy
+    pad_x, pad_y = prompt_stream.pad_offsets()
     precision_scope = precision if precision is not None else (lambda: nullcontext())
 
     # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
@@ -598,8 +601,8 @@ def _run_bbox(
                 async_loading_frames=False,
             )
         x1, y1, x2, y2 = bbox
-        scaled_x = sorted([x1 * scale_x, x2 * scale_x])
-        scaled_y = sorted([y1 * scale_y, y2 * scale_y])
+        scaled_x = sorted([x1 * scale_x + pad_x, x2 * scale_x + pad_x])
+        scaled_y = sorted([y1 * scale_y + pad_y, y2 * scale_y + pad_y])
         bbox_np = np.array(
             [
                 np.clip(scaled_x[0], 0, max(0, width - 1)),
@@ -714,6 +717,7 @@ def _run_bbox(
         "infer_W": width,
         "bbox": bbox,
         "bbox_infer": bbox_list,
+        "processed_end_frame": clip_end,
         "setup_ms": round(setup_secs * 1000.0, 2),
     }
 

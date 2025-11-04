@@ -178,9 +178,10 @@ def _run_points(
     sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
+    pad_x, pad_y = prompt_stream.pad_offsets()
     points_np = np.array([[p[0] * scale_x, p[1] * scale_y] for p in points], dtype=np.float32)
-    points_np[:, 0] = np.clip(points_np[:, 0], 0, max(0, infer_w - 1))
-    points_np[:, 1] = np.clip(points_np[:, 1], 0, max(0, infer_h - 1))
+    points_np[:, 0] = np.clip(points_np[:, 0] + pad_x, 0, max(0, infer_w - 1))
+    points_np[:, 1] = np.clip(points_np[:, 1] + pad_y, 0, max(0, infer_h - 1))
     points_list = points_np.tolist()
     labels_np = np.array(labels, dtype=np.int32)
     labels_list = labels_np.tolist()
@@ -313,6 +314,7 @@ def _run_points(
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
         "frames": clip_end - prompt_frame_idx,
+        "processed_end_frame": clip_end,
         "H": orig_h,
         "W": orig_w,
         "infer_H": infer_h,
@@ -416,9 +418,10 @@ def _run_bbox(
     sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
+    pad_x, pad_y = prompt_stream.pad_offsets()
     x1, y1, x2, y2 = bbox
-    scaled_x = sorted([x1 * scale_x, x2 * scale_x])
-    scaled_y = sorted([y1 * scale_y, y2 * scale_y])
+    scaled_x = sorted([x1 * scale_x + pad_x, x2 * scale_x + pad_x])
+    scaled_y = sorted([y1 * scale_y + pad_y, y2 * scale_y + pad_y])
     bbox_np = np.array(
         [
             np.clip(scaled_x[0], 0, max(0, infer_w - 1)),
@@ -559,6 +562,7 @@ def _run_bbox(
         "W": orig_w,
         "infer_H": infer_h,
         "infer_W": infer_w,
+        "processed_end_frame": clip_end,
         "bbox": bbox,
         "bbox_infer": bbox_list,
         "setup_ms": round(setup_secs * 1000.0, 2),
