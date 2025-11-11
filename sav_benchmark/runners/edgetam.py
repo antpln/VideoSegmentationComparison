@@ -207,7 +207,6 @@ def _run_points(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
-    max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
     _attempt: int = 1,
 ) -> Dict[str, object]:
     _ = ()
@@ -354,8 +353,8 @@ def _run_points(
         points_np[:, 0] = np.clip(points_np[:, 0], 0, max(0, width - 1))
         points_np[:, 1] = np.clip(points_np[:, 1], 0, max(0, height - 1))
         labels_np = np.array(labels, dtype=np.int32)
+        # Keep every propagated mask so evaluation has the full sequence.
         sub_masks: Dict[int, Optional[np.ndarray]] = {}
-        mask_indices: List[int] = []
         mask_logits_count = 0
         positive_logits_count = 0
         with precision_scope():
@@ -425,11 +424,6 @@ def _run_points(
                             ).astype(bool)
                     if 0 <= frame_idx < sub_frame_count:
                         sub_masks[frame_idx] = mask_np
-                        mask_indices.append(frame_idx)
-                        # Remove oldest if exceeding max_frames_in_mem
-                        if len(mask_indices) > max_frames_in_mem:
-                            oldest = mask_indices.pop(0)
-                            del sub_masks[oldest]
                 except Exception as per_frame_exc:
                     print(f"[ERROR EdgeTAM] per-frame failure at frame {frame_idx}: {per_frame_exc}")
                     print(traceback.format_exc())
@@ -460,7 +454,6 @@ def _run_points(
                 compile_model=compile_model,
                 compile_mode=compile_mode,
                 compile_backend=compile_backend,
-                max_frames_in_mem=max_frames_in_mem,
                 _attempt=_attempt + 1,
             )
         print(f"[ERROR] EdgeTAM points inference failed (attempt {_attempt}): {exc}")
@@ -550,7 +543,6 @@ def _run_bbox(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
-    max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
     _attempt: int = 1,
 ) -> Dict[str, object]:
     _ = (imgsz, device)
@@ -661,6 +653,8 @@ def _run_bbox(
             ],
             dtype=np.float32,
         )
+        # Capture every processed frame so evaluation can score the full clip.
+        sub_masks: List[Optional[np.ndarray]] = [None] * sub_frame_count
         with precision_scope():
             predictor.add_new_points_or_box(
                 inference_state=inference_state,
@@ -669,7 +663,6 @@ def _run_bbox(
                 box=bbox_np,
             )
             inference_start = time.perf_counter()
-            sub_masks: List[Optional[np.ndarray]] = [None] * sub_frame_count
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
                 if mask_logits is None or 1 not in obj_ids:
                     continue
@@ -727,7 +720,6 @@ def _run_bbox(
                 compile_model=compile_model,
                 compile_mode=compile_mode,
                 compile_backend=compile_backend,
-                max_frames_in_mem=max_frames_in_mem,
                 _attempt=_attempt + 1,
             )
         print(f"[ERROR] EdgeTAM bbox inference failed (attempt {_attempt}): {exc}")

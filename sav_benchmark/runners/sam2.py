@@ -95,7 +95,6 @@ def _run_points(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
-    max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     # Derive a SINGLE positive prompt point from the supplied mask (fairness across models).
     points, labels = extract_points_from_mask(prompt_mask, num_points=1)
@@ -172,8 +171,8 @@ def _run_points(
     }
 
     # Replace sub_masks with a dict for sliding window
+    # Retain every predicted frame so evaluation covers the full propagated sequence.
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
-    mask_indices: List[int] = []
     inference_start: float | None = None
     sub_frame_count = clip_end - prompt_frame_idx
 
@@ -230,11 +229,6 @@ def _run_points(
                             ).astype(bool)
                         if 0 <= frame_idx < sub_frame_count:
                             sub_masks[frame_idx] = mask
-                            mask_indices.append(frame_idx)
-                            # Remove oldest if exceeding max_frames_in_mem
-                            if len(mask_indices) > max_frames_in_mem:
-                                oldest = mask_indices.pop(0)
-                                del sub_masks[oldest]
         else:
             # Fallback for newer Ultralytics builds that only expose the streaming API.
             with precision_scope():
@@ -347,7 +341,6 @@ def _run_bbox(
     compile_model: bool = False,
     compile_mode: str | None = "reduce-overhead",
     compile_backend: str | None = None,
-    max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     bbox = extract_bbox_from_mask(prompt_mask)
     if bbox is None:
@@ -419,8 +412,8 @@ def _run_bbox(
     }
 
     # Replace sub_masks with a dict for sliding window
+    # Keep the full prediction history; dropping frames would zero-out metrics later.
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
-    mask_indices: List[int] = []
     inference_start: float | None = None
     sub_frame_count = clip_end - prompt_frame_idx
 
@@ -478,11 +471,6 @@ def _run_bbox(
                             ).astype(bool)
                         if 0 <= frame_idx < sub_frame_count:
                             sub_masks[frame_idx] = mask
-                            mask_indices.append(frame_idx)
-                            # Remove oldest if exceeding max_frames_in_mem
-                            if len(mask_indices) > max_frames_in_mem:
-                                oldest = mask_indices.pop(0)
-                                del sub_masks[oldest]
         else:
             # Fallback for predictor builds exposing only the streaming interface.
             with precision_scope():
