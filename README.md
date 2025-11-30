@@ -55,13 +55,20 @@ Quick runners to compare SAM2 and EdgeTAM on the SA-V dataset (points and bbox p
 - Weights: SAM2 (`sam2.1_*.pt`) and EdgeTAM (`EdgeTAM/checkpoints/edgetam.pt`)
 - Python with PyTorch, OpenCV, and Ultralytics installed
 
-## Run a fast sanity check
+## Branches
+
+- **`main`**: Accuracy benchmarking (J, J&F metrics)
+- **`nsight`**: GPU profiling with NVIDIA Nsight Systems (FPS, memory, kernel timing)
+
+## Quick Start - Accuracy Benchmarking (main branch)
+
+### Run a fast sanity check
 ```bash
 python sam_comparison.py --test_mode --models sam2_base_points
 ```
 Writes synthetic results to `./test_outputs`.
 
-## Benchmark on SA-V
+### Benchmark on SA-V
 ```bash
 python sam_comparison.py \
   --split_dir /path/to/sav_val \
@@ -70,3 +77,26 @@ python sam_comparison.py \
   --save_overlays 1
 ```
 Outputs `sav_benchmark_summary.csv` (and overlays when requested) in the chosen directory.
+
+## GPU Profiling (nsight branch)
+
+For comprehensive GPU performance profiling with NVIDIA Nsight Systems:
+
+```bash
+# Switch to nsight branch
+git checkout nsight
+
+# Test setup
+./run_test.sh
+
+# Run full profiling experiment
+./run_full_experiment.sh --split_dir /path/to/sav_val
+
+# See EXPERIMENT_WORKFLOW.md for complete walkthrough
+```
+
+**Documentation:**
+- **`EXPERIMENT_WORKFLOW.md`**: Complete step-by-step workflow for running experiments
+- **`QUICKSTART.md`**: Quick setup guide
+- **`PROFILING_SETUP.md`**: Overview of profiling infrastructure
+- **`PROFILE_README.md`**: Detailed command-line reference

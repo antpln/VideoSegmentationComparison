@@ -1,0 +1,22 @@
+# Core dependencies for Video Segmentation Comparison
+# Works on both RTX 3090 and Jetson Orin
+
+# PyTorch (install separately based on platform)
+# For RTX 3090: pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# For Jetson: pre-installed with JetPack 6.2
+
+# Computer Vision
+opencv-python>=4.5.0
+pillow>=9.0.0
+
+# Ultralytics SAM2
+ultralytics>=8.0.0
+
+# Numerical computing
+numpy>=1.21.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Optional: NVTX for inline profiling
+# nvtx>=0.2.0
