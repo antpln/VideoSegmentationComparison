@@ -72,6 +72,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=0,
         help="Process at most this many frames after the prompt (0 = full video)",
     )
+    parser.add_argument(
+        "--annotation_stride_frames",
+        type=int,
+        default=0,
+        help="Only score annotations spaced by this many video frames (0 = use every annotation)",
+    )
     parser.add_argument("--shuffle_videos", action="store_true", help="Shuffle video order before limiting / processing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling (implies --shuffle_videos)")
     parser.add_argument(
@@ -289,6 +295,13 @@ def run(args: argparse.Namespace) -> Path:
 
     summary_rows: List[Dict[str, object]] = []
     csv_path = out_dir / "sav_benchmark_summary.csv"
+    annotation_stride = getattr(args, "annotation_stride_frames", 0)
+    try:
+        annotation_stride = int(annotation_stride)
+    except (TypeError, ValueError):
+        annotation_stride = 0
+    annotation_stride = max(0, annotation_stride)
+    args.annotation_stride_frames = annotation_stride
 
     for video_idx, video_id in enumerate(video_ids, start=1):
         print(f"\n[{video_idx}/{len(video_ids)}] Video: {video_id}")
@@ -310,6 +323,24 @@ def run(args: argparse.Namespace) -> Path:
             if not frame_indices:
                 continue
             prompt_idx = frame_indices[0]
+            if annotation_stride > 1:
+                initial_count = len(frame_indices)
+                filtered_indices: List[int] = []
+                for idx in frame_indices:
+                    if idx < prompt_idx:
+                        continue
+                    if (idx - prompt_idx) % annotation_stride == 0:
+                        filtered_indices.append(idx)
+                if not filtered_indices:
+                    filtered_indices = [prompt_idx]
+                    print(
+                        f"  [obj {obj_id}] annotation stride {annotation_stride} removed all frames; using prompt frame only."
+                    )
+                elif len(filtered_indices) != initial_count:
+                    print(
+                        f"  [obj {obj_id}] annotation stride {annotation_stride} reducing frames {len(filtered_indices)}/{initial_count}."
+                    )
+                frame_indices = filtered_indices
             mask_path = split_dir / "Annotations_6fps" / video_id / obj_id / f"{prompt_idx:05d}.png"
             prompt_mask = load_mask_png(mask_path)
             if prompt_mask is None:
@@ -362,7 +393,8 @@ def run(args: argparse.Namespace) -> Path:
                     for idx in frame_indices
                     if processed_end is None or processed_end == 0 or idx < processed_end
                 ]
-                if not scored_indices:
+                scored_count = len(scored_indices)
+                if scored_count == 0:
                     print("    -> No frames selected for metric evaluation (clip truncated before annotations).")
                     continue
 
@@ -388,6 +420,7 @@ def run(args: argparse.Namespace) -> Path:
                     "precision": precision_mode.precision,
                     "frames": result.get("frames"),
                     "processed_end_frame": processed_end,
+                    "scored_frames": scored_count,
                     "fps": None if result.get("fps") is None else round(result["fps"], 2),
                     "latency_ms": None if result.get("latency_ms") is None else round(result["latency_ms"], 1),
                     "gpu_peak_alloc_MiB": to_mib(result.get("gpu_peak_alloc")),
@@ -401,6 +434,7 @@ def run(args: argparse.Namespace) -> Path:
                     "input_W": result.get("W"),
                     "infer_H": result.get("infer_H"),
                     "infer_W": result.get("infer_W"),
+                    "annotation_stride_frames": annotation_stride if annotation_stride > 0 else None,
                 }
                 # Include setup time if provided by runner (e.g., SAM2 separation of build vs inference)
                 if "setup_ms" in result:
