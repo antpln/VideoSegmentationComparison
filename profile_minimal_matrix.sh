@@ -42,6 +42,13 @@ for model in "${MODEL_ARRAY[@]}"; do
     echo "\n=== Profiling model: ${model_tag} ==="
     echo "Output: ${out_dir}"
 
+    # Quick syntax/import sanity check before launching Nsight to avoid
+    # producing large profiler artifacts when the Python process fails at import.
+    if ! python3 -m py_compile ./sam_gpu_profiles.py ./sav_benchmark/main.py; then
+        echo "ERROR: Python syntax check failed for sam_gpu_profiles.py or sav_benchmark/main.py. Skipping ${model_tag}."
+        continue
+    fi
+
     # Run nsight wrapper in test mode (synthetic data) to avoid touching dataset
     # Use run_nsight_profile.sh which will create nsight reports and CSV in out_dir
     NSYS_OUTPUT_DIR="${out_dir}/nsight_reports" \
