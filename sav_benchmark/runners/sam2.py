@@ -97,6 +97,7 @@ def _run_points(
     out_dir: Optional[Path] = None,
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
+    frame_stride: int = 1,
     num_points: int = 5,
     *,
     precision=None,
@@ -133,6 +134,12 @@ def _run_points(
     if max_clip_frames is not None and max_clip_frames > 0:
         clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
 
+    frame_stride = max(1, int(frame_stride))
+    processed_indices = list(range(prompt_frame_idx, clip_end, frame_stride))
+    if not processed_indices:
+        processed_indices = [prompt_frame_idx]
+    sub_frame_count = len(processed_indices)
+
     clipped_paths = frames_24fps[:clip_end]
 
     square_override = _square_override(imgsz)
@@ -157,9 +164,19 @@ def _run_points(
 
     # SAM2 expects a video file; write the subsequence to a temporary mp4 using a generator.
     tmp_mp4 = _temp_video("sam2_points_")
+    def _strided_prompt_frames():
+        yielded = 0
+        for offset, frame in enumerate(prompt_stream.generator()):
+            if offset % frame_stride != 0:
+                continue
+            yield frame
+            yielded += 1
+            if yielded >= sub_frame_count:
+                break
+
     write_video_mp4(
         tmp_mp4,
-        prompt_stream.generator(),
+        _strided_prompt_frames(),
         clip_fps,
     )
 
@@ -183,7 +200,6 @@ def _run_points(
     # Retain every predicted frame so evaluation covers the full propagated sequence.
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     inference_start: float | None = None
-    sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
     pad_x, pad_y = prompt_stream.pad_offsets()
@@ -237,7 +253,8 @@ def _run_points(
                                 interpolation=cv2.INTER_NEAREST,
                             ).astype(bool)
                         if 0 <= frame_idx < sub_frame_count:
-                            sub_masks[frame_idx] = mask
+                            frame_number = processed_indices[frame_idx]
+                            sub_masks[frame_number] = mask
         else:
             # Fallback for newer Ultralytics builds that only expose the streaming API.
             with precision_scope():
@@ -269,10 +286,11 @@ def _run_points(
                                 interpolation=cv2.INTER_NEAREST,
                             ).astype(bool)
                     if mask is not None and idx < sub_frame_count:
-                        sub_masks[idx] = mask
+                        frame_number = processed_indices[idx]
+                        sub_masks[frame_number] = mask
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] SAM2 points prediction failed: {exc}")
-        sub_masks = [None] * sub_frame_count
+        sub_masks = {frame_idx: None for frame_idx in processed_indices}
 
     cuda_sync()
     if inference_start is None:  # If failure before timing began, treat inference time as 0.
@@ -283,11 +301,9 @@ def _run_points(
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
     # Convert sub_masks dict or list to list for output (None for missing)
-    if isinstance(sub_masks, dict):
-        sub_masks_list = [sub_masks.get(i, None) for i in range(sub_frame_count)]
-    else:
-        sub_masks_list = [sub_masks[i] if i < len(sub_masks) else None for i in range(sub_frame_count)]
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
+    masks_seq: List[Optional[np.ndarray]] = [None] * clip_end
+    for frame_idx in processed_indices:
+        masks_seq[frame_idx] = sub_masks.get(frame_idx)
 
     overlay_path = None
     if out_dir and overlay_name:
@@ -317,7 +333,7 @@ def _run_points(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": clip_end - prompt_frame_idx,
+        "frames": sub_frame_count,
         "processed_end_frame": clip_end,
         "H": orig_h,
         "W": orig_w,
@@ -344,6 +360,7 @@ def _run_bbox(
     out_dir: Optional[Path] = None,
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
+    frame_stride: int = 1,
     *,
     precision=None,
     max_clip_frames: Optional[int] = None,
@@ -379,6 +396,12 @@ def _run_bbox(
     if max_clip_frames is not None and max_clip_frames > 0:
         clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
 
+    frame_stride = max(1, int(frame_stride))
+    processed_indices = list(range(prompt_frame_idx, clip_end, frame_stride))
+    if not processed_indices:
+        processed_indices = [prompt_frame_idx]
+    sub_frame_count = len(processed_indices)
+
     clipped_paths = frames_24fps[:clip_end]
 
     square_override = _square_override(imgsz)
@@ -403,7 +426,18 @@ def _run_bbox(
 
     # Persist the subsequence so SAM2VideoPredictor can stream it.
     tmp_mp4 = _temp_video("sam2_bbox_")
-    write_video_mp4(tmp_mp4, prompt_stream.generator(), clip_fps)
+
+    def _strided_prompt_frames():
+        yielded = 0
+        for offset, frame in enumerate(prompt_stream.generator()):
+            if offset % frame_stride != 0:
+                continue
+            yield frame
+            yielded += 1
+            if yielded >= sub_frame_count:
+                break
+
+    write_video_mp4(tmp_mp4, _strided_prompt_frames(), clip_fps)
 
     process = psutil.Process()
     reset_gpu_peaks()
@@ -424,7 +458,7 @@ def _run_bbox(
     # Keep the full prediction history; dropping frames would zero-out metrics later.
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     inference_start: float | None = None
-    sub_frame_count = clip_end - prompt_frame_idx
+    # sub_frame_count derived above from processed_indices
 
     scale_x, scale_y = prompt_stream.scale_xy
     pad_x, pad_y = prompt_stream.pad_offsets()
@@ -480,7 +514,8 @@ def _run_bbox(
                                 interpolation=cv2.INTER_NEAREST,
                             ).astype(bool)
                         if 0 <= frame_idx < sub_frame_count:
-                            sub_masks[frame_idx] = mask
+                            frame_number = processed_indices[frame_idx]
+                            sub_masks[frame_number] = mask
         else:
             # Fallback for predictor builds exposing only the streaming interface.
             with precision_scope():
@@ -514,10 +549,11 @@ def _run_bbox(
                                 interpolation=cv2.INTER_NEAREST,
                             ).astype(bool)
                     if mask is not None and idx < sub_frame_count:
-                        sub_masks[idx] = mask
+                        frame_number = processed_indices[idx]
+                        sub_masks[frame_number] = mask
     except Exception as exc:  # pragma: no cover
         print(f"[ERROR] SAM2 bbox prediction failed: {exc}")
-        sub_masks = [None] * sub_frame_count
+        sub_masks = {frame_idx: None for frame_idx in processed_indices}
 
     cuda_sync()
     if inference_start is None:
@@ -527,11 +563,9 @@ def _run_bbox(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    if isinstance(sub_masks, dict):
-        sub_masks_list = [sub_masks.get(i, None) for i in range(sub_frame_count)]
-    else:
-        sub_masks_list = [sub_masks[i] if i < len(sub_masks) else None for i in range(sub_frame_count)]
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
+    masks_seq: List[Optional[np.ndarray]] = [None] * clip_end
+    for frame_idx in processed_indices:
+        masks_seq[frame_idx] = sub_masks.get(frame_idx)
 
     overlay_path = None
     if out_dir and overlay_name:
@@ -562,12 +596,13 @@ def _run_bbox(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": clip_end - prompt_frame_idx,
+        "frames": sub_frame_count,
         "H": orig_h,
         "W": orig_w,
         "infer_H": infer_h,
         "infer_W": infer_w,
         "processed_end_frame": clip_end,
+        "processed_frame_indices": processed_indices,
         "bbox": bbox,
         "bbox_infer": bbox_list,
         "scale_x": scale_x,
@@ -602,6 +637,7 @@ class SAM2(Model):
         out_dir: Optional[Path] = None,
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
+        frame_stride: int = 1,
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
@@ -619,6 +655,7 @@ class SAM2(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            frame_stride=frame_stride,
             precision=precision,
             max_clip_frames=max_clip_frames,
             compile_model=compile_model,
@@ -637,6 +674,7 @@ class SAM2(Model):
         out_dir: Optional[Path] = None,
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
+        frame_stride: int = 1,
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
@@ -654,6 +692,7 @@ class SAM2(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            frame_stride=frame_stride,
             precision=precision,
             max_clip_frames=max_clip_frames,
             compile_model=compile_model,

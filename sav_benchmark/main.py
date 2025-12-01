@@ -73,6 +73,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Process at most this many frames after the prompt (0 = full video)",
     )
     parser.add_argument(
+        "--input_frame_stride",
+        type=int,
+        default=1,
+        help="Only feed every Nth frame to the models (1 = use every frame)",
+    )
+    parser.add_argument(
         "--annotation_stride_frames",
         type=int,
         default=0,
@@ -303,6 +309,16 @@ def run(args: argparse.Namespace) -> Path:
     annotation_stride = max(0, annotation_stride)
     args.annotation_stride_frames = annotation_stride
 
+    frame_stride = getattr(args, "input_frame_stride", 1)
+    try:
+        frame_stride = int(frame_stride)
+    except (TypeError, ValueError):
+        frame_stride = 1
+    frame_stride = max(1, frame_stride)
+    args.input_frame_stride = frame_stride
+    base_clip_fps = 24.0
+    effective_clip_fps = base_clip_fps / float(frame_stride)
+
     for video_idx, video_id in enumerate(video_ids, start=1):
         print(f"\n[{video_idx}/{len(video_ids)}] Video: {video_id}")
         frames = list_frames_24fps(split_dir, video_id)
@@ -379,12 +395,13 @@ def run(args: argparse.Namespace) -> Path:
                     device=device,
                     out_dir=out_dir if args.save_overlays else None,
                     overlay_name=overlay_name,
-                    clip_fps=24.0,
+                    clip_fps=effective_clip_fps,
                     precision=precision_mode,
                     max_clip_frames=args.max_clip_frames,
                     compile_model=args.compile_models,
                     compile_mode=args.compile_mode,
                     compile_backend=args.compile_backend,
+                    frame_stride=frame_stride,
                 )
 
                 processed_end = result.get("processed_end_frame")
@@ -393,6 +410,10 @@ def run(args: argparse.Namespace) -> Path:
                     for idx in frame_indices
                     if processed_end is None or processed_end == 0 or idx < processed_end
                 ]
+                processed_frames = result.get("processed_frame_indices")
+                if processed_frames:
+                    processed_set = {int(idx) for idx in processed_frames}
+                    scored_indices = [idx for idx in scored_indices if idx in processed_set]
                 scored_count = len(scored_indices)
                 if scored_count == 0:
                     print("    -> No frames selected for metric evaluation (clip truncated before annotations).")
@@ -417,6 +438,8 @@ def run(args: argparse.Namespace) -> Path:
                     "object": obj_id,
                     "model": tag,
                     "imgsz": args.imgsz,
+                    "input_frame_stride": frame_stride,
+                    "input_fps": round(effective_clip_fps, 3),
                     "precision": precision_mode.precision,
                     "frames": result.get("frames"),
                     "processed_end_frame": processed_end,

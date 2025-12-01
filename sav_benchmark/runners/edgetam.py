@@ -214,6 +214,7 @@ def _run_points(
     out_dir: Optional[Path] = None,
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
+    frame_stride: int = 1,
     num_points: int = 5,
     *,
     precision=None,
@@ -253,10 +254,11 @@ def _run_points(
     if max_clip_frames is not None and max_clip_frames > 0:
         clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
 
-    sub_frame_paths = frames_24fps[prompt_frame_idx:clip_end]
-    sub_frame_count = len(sub_frame_paths)
-    if sub_frame_count == 0:
-        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+    frame_stride = max(1, int(frame_stride))
+    processed_indices = list(range(prompt_frame_idx, clip_end, frame_stride))
+    if not processed_indices:
+        processed_indices = [prompt_frame_idx]
+    sub_frame_count = len(processed_indices)
 
     safe_imgsz = _safe_image_size(imgsz)
     inference_hw = None
@@ -312,8 +314,14 @@ def _run_points(
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
-        for idx, frame in enumerate(prompt_stream.generator()):
-            cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
+        written = 0
+        for offset, frame in enumerate(prompt_stream.generator()):
+            if offset % frame_stride != 0:
+                continue
+            cv2.imwrite(str(temp_dir / f"{written:05d}.jpg"), frame)
+            written += 1
+            if written >= sub_frame_count:
+                break
         _log_debug(
             f"[DEBUG EdgeTAM] prepared temp frames at {temp_dir} with {sub_frame_count} images (orig={orig_height}x{orig_width} -> infer={height}x{width})"
         )
@@ -322,7 +330,6 @@ def _run_points(
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
     inference_start: float | None = None
-    sub_masks_list: List[Optional[np.ndarray]]
 
     # Separate try/except to pinpoint init_state failures
     try:
@@ -434,22 +441,21 @@ def _run_points(
                     # Handle swapped (W,H) by transposing if it exactly matches the swapped dims
                     if mask_np.shape == (width, height):
                         mask_np = mask_np.T
-                        if mask_np.shape != (height, width):
-                            mask_np = cv2.resize(
-                                mask_np.astype(np.uint8),
-                                (width, height),
-                                interpolation=cv2.INTER_NEAREST,
-                            ).astype(bool)
+                    if mask_np.shape != (height, width):
+                        mask_np = cv2.resize(
+                            mask_np.astype(np.uint8),
+                            (width, height),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
                     if 0 <= frame_idx < sub_frame_count:
-                        sub_masks[frame_idx] = mask_np
+                        frame_number = processed_indices[frame_idx]
+                        sub_masks[frame_number] = mask_np
                 except Exception as per_frame_exc:
                     print(f"[ERROR EdgeTAM] per-frame failure at frame {frame_idx}: {per_frame_exc}")
                     print(traceback.format_exc())
-        # Convert sub_masks dict to list for output (None for missing)
-        sub_masks_list = [sub_masks.get(i, None) for i in range(sub_frame_count)]
-
+        stored_masks = sum(1 for idx in processed_indices if sub_masks.get(idx) is not None)
         _log_debug(
-            f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks_list)}"
+            f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={stored_masks}"
         )
     except Exception as exc:  # pragma: no cover
         if _should_retry_cuda_error(exc) and _attempt < _MAX_CUDA_RETRIES:
@@ -467,6 +473,7 @@ def _run_points(
                 out_dir=out_dir,
                 overlay_name=overlay_name,
                 clip_fps=clip_fps,
+                frame_stride=frame_stride,
                 precision=precision,
                 max_clip_frames=max_clip_frames,
                 compile_model=compile_model,
@@ -476,7 +483,7 @@ def _run_points(
             )
         print(f"[ERROR] EdgeTAM points inference failed (attempt {_attempt}): {exc}")
         print(traceback.format_exc())
-        sub_masks_list = [None] * sub_frame_count
+        sub_masks = {frame_idx: None for frame_idx in processed_indices}
         if inference_start is None:
             inference_start = time.perf_counter()
 
@@ -488,9 +495,11 @@ def _run_points(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    if 'sub_masks_list' not in locals():
-        sub_masks_list = [None] * sub_frame_count
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
+    if 'sub_masks' not in locals():
+        sub_masks = {frame_idx: None for frame_idx in processed_indices}
+    masks_seq: List[Optional[np.ndarray]] = [None] * clip_end
+    for frame_idx in processed_indices:
+        masks_seq[frame_idx] = sub_masks.get(frame_idx)
 
     # Debug: log mask statistics
     valid_masks = sum(1 for m in masks_seq if m is not None)
@@ -528,13 +537,14 @@ def _run_points(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": clip_end - prompt_frame_idx,
+        "frames": sub_frame_count,
         "H": orig_height,
         "W": orig_width,
         "infer_H": height,
         "infer_W": width,
         "processed_end_frame": clip_end,
         "num_points": len(points),  # will be 1 under the single-point policy
+        "processed_frame_indices": processed_indices,
         "scale_x": scale_x,
         "scale_y": scale_y,
         "pad_x": pad_x,
@@ -555,6 +565,7 @@ def _run_bbox(
     out_dir: Optional[Path] = None,
     overlay_name: Optional[str] = None,
     clip_fps: float = 24.0,
+    frame_stride: int = 1,
     *,
     precision=None,
     max_clip_frames: Optional[int] = None,
@@ -605,10 +616,11 @@ def _run_bbox(
     if max_clip_frames is not None and max_clip_frames > 0:
         clip_end = min(total_frames, prompt_frame_idx + max_clip_frames)
 
-    sub_frame_paths = frames_24fps[prompt_frame_idx:clip_end]
-    sub_frame_count = len(sub_frame_paths)
-    if sub_frame_count == 0:
-        raise IndexError(f"Prompt index {prompt_frame_idx} is out of range for {total_frames} frames")
+    frame_stride = max(1, int(frame_stride))
+    processed_indices = list(range(prompt_frame_idx, clip_end, frame_stride))
+    if not processed_indices:
+        processed_indices = [prompt_frame_idx]
+    sub_frame_count = len(processed_indices)
 
     safe_imgsz = _safe_image_size(imgsz)
     inference_hw = None
@@ -642,8 +654,14 @@ def _run_bbox(
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
-        for idx, frame in enumerate(prompt_stream.generator()):
-            cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
+        written = 0
+        for offset, frame in enumerate(prompt_stream.generator()):
+            if offset % frame_stride != 0:
+                continue
+            cv2.imwrite(str(temp_dir / f"{written:05d}.jpg"), frame)
+            written += 1
+            if written >= sub_frame_count:
+                break
     except Exception as e:
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
@@ -672,7 +690,7 @@ def _run_bbox(
             dtype=np.float32,
         )
         # Capture every processed frame so evaluation can score the full clip.
-        sub_masks: List[Optional[np.ndarray]] = [None] * sub_frame_count
+        sub_masks: Dict[int, Optional[np.ndarray]] = {}
         with precision_scope():
             predictor.add_new_points_or_box(
                 inference_state=inference_state,
@@ -716,7 +734,8 @@ def _run_bbox(
                         interpolation=cv2.INTER_NEAREST,
                     ).astype(bool)
                 if 0 <= frame_idx < sub_frame_count:
-                    sub_masks[frame_idx] = mask_np
+                    frame_number = processed_indices[frame_idx]
+                    sub_masks[frame_number] = mask_np
     except Exception as exc:  # pragma: no cover
         if _should_retry_cuda_error(exc) and _attempt < _MAX_CUDA_RETRIES:
             print(
@@ -733,6 +752,7 @@ def _run_bbox(
                 out_dir=out_dir,
                 overlay_name=overlay_name,
                 clip_fps=clip_fps,
+                frame_stride=frame_stride,
                 precision=precision,
                 max_clip_frames=max_clip_frames,
                 compile_model=compile_model,
@@ -742,7 +762,7 @@ def _run_bbox(
             )
         print(f"[ERROR] EdgeTAM bbox inference failed (attempt {_attempt}): {exc}")
         print(traceback.format_exc())
-        sub_masks = [None] * sub_frame_count
+        sub_masks = {frame_idx: None for frame_idx in processed_indices}
         if inference_start is None:
             inference_start = time.perf_counter()
 
@@ -754,7 +774,9 @@ def _run_bbox(
     gpu_alloc, gpu_reserved = get_gpu_peaks()
     cpu_peak = max(cpu_peak, process.memory_info().rss)
 
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks
+    masks_seq: List[Optional[np.ndarray]] = [None] * clip_end
+    for frame_idx in processed_indices:
+        masks_seq[frame_idx] = sub_masks.get(frame_idx)
 
     # Debug: log mask statistics
     valid_masks = sum(1 for m in masks_seq if m is not None)
@@ -793,13 +815,14 @@ def _run_bbox(
         "cpu_peak_rss": cpu_peak,
         "masks_seq": masks_seq,
         "overlay": str(overlay_path) if overlay_path else None,
-        "frames": clip_end - prompt_frame_idx,
+        "frames": sub_frame_count,
         "H": orig_height,
         "W": orig_width,
         "infer_H": height,
         "infer_W": width,
         "bbox": bbox,
         "bbox_infer": bbox_list,
+        "processed_frame_indices": processed_indices,
         "processed_end_frame": clip_end,
         "scale_x": scale_x,
         "scale_y": scale_y,
@@ -828,6 +851,7 @@ class EdgeTAM(Model):
         out_dir: Optional[Path] = None,
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
+        frame_stride: int = 1,
         num_points: int = 5,
         *,
         precision=None,
@@ -846,6 +870,7 @@ class EdgeTAM(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            frame_stride=frame_stride,
             num_points=num_points,
             precision=precision,
             max_clip_frames=max_clip_frames,
@@ -865,6 +890,7 @@ class EdgeTAM(Model):
         out_dir: Optional[Path] = None,
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
+        frame_stride: int = 1,
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
@@ -882,6 +908,7 @@ class EdgeTAM(Model):
             out_dir=out_dir,
             overlay_name=overlay_name,
             clip_fps=clip_fps,
+            frame_stride=frame_stride,
             precision=precision,
             max_clip_frames=max_clip_frames,
             compile_model=compile_model,

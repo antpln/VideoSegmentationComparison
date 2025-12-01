@@ -13,7 +13,7 @@ expects a mapping of prompt_type -> callable.
 Each runner method MUST accept the canonical parameter list used elsewhere:
 
     (frames_24fps, prompt_frame_idx, prompt_mask, imgsz, weight_name, device,
-     out_dir=None, overlay_name=None, clip_fps=24.0, *, precision=None,
+     out_dir=None, overlay_name=None, clip_fps=24.0, frame_stride=1, *, precision=None,
      compile_model=False, compile_mode="reduce-overhead", compile_backend=None)
 
 and return the standard result dictionary.
@@ -57,6 +57,7 @@ class Model(ABC):
         out_dir: Optional[Path] = None,
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
+        frame_stride: int = 1,
         *,
         precision: Any = None,
         max_clip_frames: Optional[int] = None,
@@ -77,6 +78,7 @@ class Model(ABC):
         out_dir: Optional[Path] = None,
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
+        frame_stride: int = 1,
         *,
         precision: Any = None,
         max_clip_frames: Optional[int] = None,
