@@ -67,8 +67,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--weights_dir", type=str, default=".", help="Directory containing weight files")
     parser.add_argument("--imgsz", type=int, default=768, help="Square inference image size (default: 768)")
-    parser.add_argument("--limit_videos", type=int, default=1, help="Limit number of videos (0 = all, default=1 for profiling)")
-    parser.add_argument("--limit_objects", type=int, default=1, help="Limit number of objects per video (0 = all, default=1 for profiling)")
+    parser.add_argument("--limit_videos", type=int, default=0, help="Limit number of videos (0 = all)")
+    parser.add_argument("--limit_objects", type=int, default=0, help="Limit number of objects per video (0 = all)")
     parser.add_argument(
         "--max_clip_frames",
         type=int,
