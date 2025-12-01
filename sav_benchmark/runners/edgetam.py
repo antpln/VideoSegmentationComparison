@@ -29,107 +29,70 @@ from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module,
 from ..video_ops import overlay_union, write_video_mp4
 
 
+# Placeholder for missing imports and functions that need to be defined
+DEBUG_LOGS = False
 
-                    continue
-                if mask_logits_count <= 5:
-                    print(
-                        f"[DEBUG EdgeTAM logits] frame={frame_idx} shape={logits_np.shape} min={float(logits_np.min()):.4f} max={float(logits_np.max()):.4f}"
-                    )
-                if np.count_nonzero(logits_np) > 0:
-                    positive_logits_count += 1
-                tmp = logits_np
-                thr = 0.5 if (tmp.min() >= 0.0 and tmp.max() <= 1.0) else 0.0
-                mask_np = tmp > thr
-                # Squeeze singleton dims (e.g., (1,1,H,W))
-                while mask_np.ndim > 2:
-                    if mask_np.shape[0] == 1:
-                        mask_np = mask_np[0]
-                    else:
-                        mask_np = np.any(mask_np, axis=0)
-                if mask_np.ndim != 2:
-                    continue
-                mask_np = mask_np.astype(bool)
-                if mask_np.size == 0:
-                    continue
-                # Handle swapped (W,H) by transposing if it exactly matches the swapped dims
-                if mask_np.shape == (width, height):
-                    mask_np = mask_np.T
-                if mask_np.shape != (height, width):
-                    mask_np = cv2.resize(
-                        mask_np.astype(np.uint8),
-                        (width, height),
-                        interpolation=cv2.INTER_NEAREST,
-                    ).astype(bool)
-                if 0 <= frame_idx < len(sub_frame_paths):
-                    sub_masks[frame_idx] = mask_np
-                    mask_indices.append(frame_idx)
-                    # Remove oldest if exceeding max_frames_in_mem
-                    if len(mask_indices) > max_frames_in_mem:
-                        oldest = mask_indices.pop(0)
-                        del sub_masks[oldest]
-            except Exception as per_frame_exc:
-                print(f"[ERROR EdgeTAM] per-frame failure at frame {frame_idx}: {per_frame_exc}")
-                print(traceback.format_exc())
-        # Convert sub_masks dict to list for output (None for missing)
-        sub_masks_list = [sub_masks.get(i, None) for i in range(len(sub_frame_paths))]
+def _log_debug(message: str) -> None:
+    """Debug logging function."""
+    if DEBUG_LOGS:
+        print(message)
 
-        print(
-            f"[DEBUG EdgeTAM {overlay_name or ''}] mask_logits present in {mask_logits_count} frames, positive entries in {positive_logits_count} frames; stored masks={sum(m is not None for m in sub_masks_list)}"
-        )
-    except Exception as exc:  # pragma: no cover
-        print(f"[ERROR] EdgeTAM points inference failed: {exc}")
-        print(traceback.format_exc())
-        sub_masks_list = [None] * len(sub_frame_paths)
-        if inference_start is None:
-            inference_start = time.perf_counter()
+def _read_frame(frame_path: Path) -> np.ndarray:
+    """Read a frame from file path."""
+    return cv2.imread(str(frame_path))
 
-    cuda_sync()
-    if inference_start is None:
-        inference_start = time.perf_counter()
-    duration = max(1e-9, time.perf_counter() - inference_start)
-    setup_secs = inference_start - setup_start
-    gpu_alloc, gpu_reserved = get_gpu_peaks()
-    cpu_peak = max(cpu_peak, process.memory_info().rss)
+def cleanup_after_run() -> None:
+    """Cleanup function after run."""
+    if torch and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    if 'sub_masks_list' not in locals():
-        sub_masks_list = [None] * len(sub_frame_paths)
-    masks_seq: List[Optional[np.ndarray]] = [None] * prompt_frame_idx + sub_masks_list
+def prepare_frame_stream(frames, imgsz=None, target_hw=None, force_square=False, start_idx=0):
+    """Prepare frame stream with proper scaling and padding."""
+    class FrameStream:
+        def __init__(self, frames, target_hw, original_hw, scale_xy):
+            self.frames = frames
+            self.target_hw = target_hw or original_hw
+            self.original_hw = original_hw
+            self.scale_xy = scale_xy
+        
+        def generator(self):
+            for frame_path in self.frames:
+                frame = _read_frame(frame_path)
+                if self.target_hw != self.original_hw:
+                    frame = cv2.resize(frame, (self.target_hw[1], self.target_hw[0]))
+                yield frame
+        
+        def pad_offsets(self):
+            return (0, 0)  # No padding for now
+        
+        def content_shape(self):
+            return self.target_hw
+    
+    # Get original dimensions from first frame
+    first_frame = _read_frame(frames[start_idx])
+    original_hw = first_frame.shape[:2]
+    
+    if target_hw is None:
+        target_hw = original_hw
+    
+    scale_x = target_hw[1] / original_hw[1]
+    scale_y = target_hw[0] / original_hw[0]
+    
+    return FrameStream(frames[start_idx:], target_hw, original_hw, (scale_x, scale_y))
 
-    # Debug: log mask statistics
-    valid_masks = sum(1 for m in masks_seq if m is not None)
-    total_frames = len(masks_seq)
-    print(f"[DEBUG EdgeTAM {overlay_name or ''} masks] {valid_masks}/{total_frames} frames have masks")
+def overlay_video_frames(frames, masks, output_path, fps, target_hw):
+    """Create overlay video from frames and masks."""
+    # Placeholder implementation
+    pass
 
-    overlay_path = None
-    if out_dir and overlay_name:
-        # Persist overlays only on demand.
-        overlay_path = Path(out_dir) / f"{overlay_name}.mp4"
-        _record_overlays(frames_24fps, masks_seq, overlay_path, clip_fps)
-
-    # Cleanup temporary JPEG frames directory
-    try:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-    except OSError:
-        pass
-
-    fps = len(sub_frame_paths) / duration
-
-    return {
-        "secs": duration,
-        "fps": fps,
-        "latency_ms": 1000.0 / fps,
-        "gpu_peak_alloc": gpu_alloc,
-        "gpu_peak_reserved": gpu_reserved,
-        "cpu_peak_rss": cpu_peak,
-        "masks_seq": masks_seq,
-        "overlay": str(overlay_path) if overlay_path else None,
-        "frames": len(frames_24fps),
-        "H": height,
-        "W": width,
-    "num_points": len(points),  # will be 1 under the single-point policy
-        "setup_ms": round(setup_secs * 1000.0, 2),
-    }
+def nullcontext():
+    """Null context manager."""
+    class NullContext:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+    return NullContext()
 
 
 def _run_bbox(
