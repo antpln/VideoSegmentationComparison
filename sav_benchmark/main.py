@@ -58,7 +58,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Comma-separated list of model_prompt combinations",
     )
     parser.add_argument("--weights_dir", type=str, default=".", help="Directory containing weight files")
-    parser.add_argument("--imgsz", type=int, default=1024)
+    parser.add_argument("--imgsz", type=int, default=768, help="Square inference image size (default: 768)")
     parser.add_argument(
         "--limit_videos",
         type=int,

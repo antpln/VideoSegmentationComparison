@@ -44,6 +44,9 @@ SAM2_WEIGHTS = {
     "sam2_large": "sam2.1_l.pt",
 }
 
+# Ordered from smallest to largest for memory-friendly execution
+SAM2_MODEL_ORDER = ["sam2_tiny", "sam2_small", "sam2_base", "sam2_large"]
+
 EDGETAM_WEIGHTS = {
     "edgetam": "edgetam.pt",
 }
@@ -66,6 +69,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=768, help="Square inference image size (default: 768)")
     parser.add_argument("--limit_videos", type=int, default=1, help="Limit number of videos (0 = all, default=1 for profiling)")
     parser.add_argument("--limit_objects", type=int, default=1, help="Limit number of objects per video (0 = all, default=1 for profiling)")
+    parser.add_argument(
+        "--max_clip_frames",
+        type=int,
+        default=None,
+        help="Maximum frames to process per video (default: None = all). Set to 100-200 for memory-constrained devices like Jetson.",
+    )
     parser.add_argument("--out_dir", type=str, default=None, help="Output directory for profiling results")
     parser.add_argument("--compile_models", action="store_true", help="Compile models with torch.compile before inference")
     parser.add_argument("--compile_backend", type=str, default=None, help="Optional backend to use for torch.compile")
@@ -80,9 +89,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--autocast",
         type=str,
-        default="bf16",
+        default="fp16",
         choices=["bf16", "fp16", "none"],
-        help="Enable CUDA autocast with the given dtype (bf16/fp16) or disable (none)",
+        help="Enable CUDA autocast with the given dtype (bf16/fp16) or disable (none). Default: fp16",
     )
     parser.add_argument(
         "--disable_cudnn",
@@ -222,6 +231,59 @@ def _select_runner(tag: str):
     return runner
 
 
+def _is_jetson_device() -> bool:
+    """Detect if running on a Jetson device (unified memory architecture)."""
+    if torch is None or not torch.cuda.is_available():
+        return False
+    device_name = torch.cuda.get_device_name(0).lower()
+    # Jetson devices have unified memory and report as "Orin", "Xavier", etc.
+    jetson_keywords = ("orin", "xavier", "tegra", "jetson")
+    return any(kw in device_name for kw in jetson_keywords)
+
+
+def _get_gpu_memory_gb() -> float:
+    """Get total GPU memory in GB."""
+    if torch is None or not torch.cuda.is_available():
+        return 0.0
+    try:
+        props = torch.cuda.get_device_properties(0)
+        return props.total_memory / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _auto_configure_for_device(args: argparse.Namespace) -> None:
+    """Auto-configure memory-friendly defaults for constrained devices."""
+    if torch is None or not torch.cuda.is_available():
+        return
+    
+    is_jetson = _is_jetson_device()
+    gpu_mem_gb = _get_gpu_memory_gb()
+    
+    if is_jetson or gpu_mem_gb < 12:
+        # Memory-constrained device: set conservative defaults if not already specified
+        if args.max_clip_frames is None:
+            # Limit frames to reduce memory for init_state
+            args.max_clip_frames = 150 if gpu_mem_gb >= 8 else 100
+            print(f"[AUTO] Setting max_clip_frames={args.max_clip_frames} for {gpu_mem_gb:.1f}GB GPU")
+        
+        if args.imgsz > 512 and gpu_mem_gb < 8:
+            old_imgsz = args.imgsz
+            args.imgsz = 512
+            print(f"[AUTO] Reducing imgsz from {old_imgsz} to {args.imgsz} for {gpu_mem_gb:.1f}GB GPU")
+        elif args.imgsz > 768 and gpu_mem_gb < 12:
+            old_imgsz = args.imgsz
+            args.imgsz = 768
+            print(f"[AUTO] Reducing imgsz from {old_imgsz} to {args.imgsz} for {gpu_mem_gb:.1f}GB GPU")
+
+
+def _clear_gpu_cache() -> None:
+    """Clear GPU cache to reduce memory fragmentation."""
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
 def _prepare_dataset(args: argparse.Namespace) -> Tuple[Path, Path]:
     """Resolve dataset/input directories and optionally fabricate synthetic data."""
     if args.test_mode:
@@ -316,11 +378,14 @@ def run_profile(args: argparse.Namespace) -> Path:
     split_dir, out_dir = _prepare_dataset(args)
     weights_dir = Path(args.weights_dir)
     def _all_model_tags() -> List[str]:
+        """Return all model tags ordered from smallest to largest."""
         tags: List[str] = []
-        for model_name in SAM2_WEIGHTS:
+        # EdgeTAM first (smallest/most efficient)
+        for model_name in EDGETAM_WEIGHTS:
             for prompt in ("points", "bbox"):
                 tags.append(f"{model_name}_{prompt}")
-        for model_name in EDGETAM_WEIGHTS:
+        # SAM2 models from tiny to large
+        for model_name in SAM2_MODEL_ORDER:
             for prompt in ("points", "bbox"):
                 tags.append(f"{model_name}_{prompt}")
         return tags
@@ -335,6 +400,8 @@ def run_profile(args: argparse.Namespace) -> Path:
         raise SystemExit("No valid models selected")
 
     _configure_torch(args)
+    # Auto-configure memory-friendly defaults for Jetson/constrained GPUs
+    _auto_configure_for_device(args)
     device = device_str()
 
     # Check nsight availability for external profiling
@@ -402,6 +469,9 @@ def run_profile(args: argparse.Namespace) -> Path:
                     print(f"    -> {exc}")
                     continue
 
+                # Clear GPU cache before each model to reduce fragmentation
+                _clear_gpu_cache()
+                
                 print(f"  Model {tag} | obj {obj_id} | prompt frame {prompt_idx}")
                 
                 # Warmup runs
@@ -420,6 +490,7 @@ def run_profile(args: argparse.Namespace) -> Path:
                             out_dir=None,
                             overlay_name=None,
                             clip_fps=24.0,
+                            max_clip_frames=args.max_clip_frames,
                             compile_model=args.compile_models,
                             compile_mode=args.compile_mode,
                             compile_backend=args.compile_backend,
@@ -449,6 +520,7 @@ def run_profile(args: argparse.Namespace) -> Path:
                         out_dir=None,
                         overlay_name=None,
                         clip_fps=24.0,
+                        max_clip_frames=args.max_clip_frames,
                         compile_model=args.compile_models,
                         compile_mode=args.compile_mode,
                         compile_backend=args.compile_backend,

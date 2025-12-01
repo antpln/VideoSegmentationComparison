@@ -114,7 +114,7 @@ python3 sam_gpu_profiles.py \
 - `--models LIST`: Comma-separated model tags (default: `sam2_base_points,sam2_base_bbox,edgetam_points,edgetam_bbox`)
   - Available: `sam2_tiny_*`, `sam2_small_*`, `sam2_base_*`, `sam2_large_*`, `edgetam_*`
   - Prompts: `*_points`, `*_bbox`
-- `--imgsz SIZE`: Image size for inference (default: 1024)
+- `--imgsz SIZE`: Image size for inference (default: 768)
 
 ### Profiling Configuration
 - `--profile_mode MODE`: `external` or `inline` (default: `external`)
