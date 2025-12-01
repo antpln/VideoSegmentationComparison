@@ -91,7 +91,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--precision",
         type=str,
-        default="fp32",
+        default="fp16",
         choices=["fp32", "fp16", "bf16"],
         help="Numerical precision for model execution",
     )

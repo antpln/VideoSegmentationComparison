@@ -41,7 +41,7 @@ def parse_common_args(description: str, argv: Optional[Iterable[str]] = None) ->
     parser.add_argument("--save_overlays", type=int, default=0, help="Write overlay videos when set to 1")
     parser.add_argument(
         "--precision",
-        default="fp32",
+        default="fp16",
         choices=["fp32", "fp16", "bf16"],
         help="Precision to request from the benchmark",
     )
