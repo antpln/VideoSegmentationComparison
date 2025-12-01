@@ -322,9 +322,9 @@ class EdgeTAM(Model):
         clip_fps: float = 24.0,
         num_points: int = 5,
         *,
-    compile_model: bool = False,
-    compile_mode: Optional[str] = "reduce-overhead",
-    compile_backend: Optional[str] = None,
+        compile_model: bool = False,
+        compile_mode: Optional[str] = "reduce-overhead",
+        compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
@@ -354,9 +354,9 @@ class EdgeTAM(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
-    compile_model: bool = False,
-    compile_mode: Optional[str] = "reduce-overhead",
-    compile_backend: Optional[str] = None,
+        compile_model: bool = False,
+        compile_mode: Optional[str] = "reduce-overhead",
+        compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_bbox(
             frames_24fps,
@@ -1172,9 +1172,9 @@ class EdgeTAM(Model):
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
-    compile_model: bool = False,
-    compile_mode: Optional[str] = "reduce-overhead",
-    compile_backend: Optional[str] = None,
+        compile_model: bool = False,
+        compile_mode: Optional[str] = "reduce-overhead",
+        compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
