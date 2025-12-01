@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
+from contextlib import nullcontext
 
 import cv2  # type: ignore[import]
 import numpy as np
@@ -98,8 +100,8 @@ def _maybe_compile_predictor_model(
     predictor,
     *,
     compile_model: bool,
-    compile_mode: str | None,
-    compile_backend: str | None,
+    compile_mode: Optional[str],
+    compile_backend: Optional[str],
 ) -> None:
     if not compile_model:
         return
@@ -124,8 +126,8 @@ def _run_points(
     num_points: int = 5,
     *,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     # Derive a SINGLE positive prompt point from the supplied mask (fairness across models).
@@ -176,7 +178,7 @@ def _run_points(
     # Replace sub_masks with a dict for sliding window
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     mask_indices: List[int] = []
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
     try:
         predictor = _sam2_predictor(overrides)
         # Optionally wrap the underlying module in torch.compile.
@@ -317,8 +319,8 @@ def _run_bbox(
     clip_fps: float = 24.0,
     *,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     bbox = extract_bbox_from_mask(prompt_mask)
@@ -365,7 +367,7 @@ def _run_bbox(
     # Replace sub_masks with a dict for sliding window
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
     mask_indices: List[int] = []
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
     try:
         predictor = _sam2_predictor(overrides)
         _maybe_compile_predictor_model(
@@ -510,9 +512,9 @@ class SAM2(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
@@ -541,9 +543,9 @@ class SAM2(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_bbox(
             frames_24fps,
@@ -563,29 +565,6 @@ class SAM2(Model):
 
 SAM2_MODEL = SAM2()
 SAM2_RUNNERS = SAM2_MODEL.register()
-"""Runners for SAM2 variants."""
-
-from __future__ import annotations
-
-import os
-import tempfile
-import time
-from contextlib import nullcontext
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
-
-import cv2  # type: ignore[import]
-import numpy as np
-import psutil
-
-try:
-    from ultralytics.models.sam import SAM2VideoPredictor  # type: ignore[import]
-except Exception:  # pragma: no cover - ultralytics optional
-    SAM2VideoPredictor = None  # type: ignore
-
-from ..prompts import extract_bbox_from_mask, extract_points_from_mask
-from .base import Model
-from ..utils import cuda_sync, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
 from ..video_ops import overlay_video_frames, prepare_frame_stream, write_video_mp4
 
 
@@ -639,8 +618,8 @@ def _maybe_compile_predictor_model(
     predictor,
     *,
     compile_model: bool,
-    compile_mode: str | None,
-    compile_backend: str | None,
+    compile_mode: Optional[str],
+    compile_backend: Optional[str],
 ) -> None:
     if not compile_model:
         return
@@ -667,8 +646,8 @@ def _run_points(
     precision=None,
     max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
 ) -> Dict[str, object]:
     # Derive a SINGLE positive prompt point from the supplied mask (fairness across models).
     points, labels = extract_points_from_mask(prompt_mask, num_points=1)
@@ -747,7 +726,7 @@ def _run_points(
     # Replace sub_masks with a dict for sliding window
     # Retain every predicted frame so evaluation covers the full propagated sequence.
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
     sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
@@ -913,8 +892,8 @@ def _run_bbox(
     precision=None,
     max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
 ) -> Dict[str, object]:
     bbox = extract_bbox_from_mask(prompt_mask)
     if bbox is None:
@@ -988,7 +967,7 @@ def _run_bbox(
     # Replace sub_masks with a dict for sliding window
     # Keep the full prediction history; dropping frames would zero-out metrics later.
     sub_masks: Dict[int, Optional[np.ndarray]] = {}
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
     sub_frame_count = clip_end - prompt_frame_idx
 
     scale_x, scale_y = prompt_stream.scale_xy
@@ -1170,9 +1149,9 @@ class SAM2(Model):
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
@@ -1205,9 +1184,9 @@ class SAM2(Model):
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_bbox(
             frames_24fps,

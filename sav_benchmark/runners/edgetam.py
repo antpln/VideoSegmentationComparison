@@ -29,342 +29,7 @@ from ..utils import cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module,
 from ..video_ops import overlay_union, write_video_mp4
 
 
-def _find_existing(paths: List[str]) -> Optional[Path]:
-    """Return the first existing path from the provided candidate list."""
-    for candidate in paths:
-        resolved = Path(expand_path(candidate))
-        if resolved.exists():
-            return resolved
-    return None
 
-
-def _read_frame(path: Path) -> np.ndarray:
-    """Load a single frame as a BGR numpy array."""
-    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise FileNotFoundError(f"Could not read frame {path}")
-    return frame
-
-
-def _gpu_debug_snapshot(stage: str) -> None:
-    """Print a concise CPU/GPU memory snapshot for debugging."""
-    try:
-        vm = psutil.virtual_memory()
-        print(f"[DEBUG mem {stage}] CPU used={vm.used/1e9:.2f}G avail={vm.available/1e9:.2f}G rss={psutil.Process().memory_info().rss/1e9:.2f}G")
-    except Exception:
-        pass
-    try:
-        if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():
-            dev = torch.cuda.current_device()
-            total_free = None
-            try:
-                free_b, total_b = torch.cuda.mem_get_info(dev)
-                total_free = (free_b/1e9, total_b/1e9)
-            except Exception:
-                total_free = None
-            name = torch.cuda.get_device_name(dev)
-            allocated = torch.cuda.memory_allocated(dev)/1e9
-            reserved = torch.cuda.memory_reserved(dev)/1e9
-            max_alloc = torch.cuda.max_memory_allocated(dev)/1e9
-            max_res = torch.cuda.max_memory_reserved(dev)/1e9
-            free_str = f" free={total_free[0]:.2f}G/{total_free[1]:.2f}G" if total_free else ""
-            print(f"[DEBUG cuda {stage}] dev={dev} {name} alloc={allocated:.2f}G resv={reserved:.2f}G max_alloc={max_alloc:.2f}G max_resv={max_res:.2f}G{free_str}")
-    except Exception:
-        pass
-
-
-def _record_overlays(frames: List[Path], masks_seq: List[Optional[np.ndarray]], output_path: Path, fps: float) -> str:
-    """Write an overlay video that blends predictions with their source frames."""
-    overlays: List[np.ndarray] = []
-    for idx, frame_path in enumerate(frames):
-        frame = _read_frame(frame_path)
-        mask = masks_seq[idx] if idx < len(masks_seq) else None
-        if mask is None:
-            overlays.append(frame)
-            continue
-        mask_arr = np.asarray(mask)
-        if mask_arr.size == 0:
-            overlays.append(frame)
-            continue
-        if mask_arr.ndim > 2:
-            mask_arr = np.any(mask_arr.astype(bool), axis=0)
-        else:
-            mask_arr = mask_arr.astype(bool)
-        if mask_arr.ndim != 2:
-            overlays.append(frame)
-            continue
-        # Handle potential transposed (H,W) mismatch (e.g., logits came as (W,H)).
-        if mask_arr.shape[0] == frame.shape[1] and mask_arr.shape[1] == frame.shape[0]:
-            # Transpose to match frame (H,W)
-            mask_arr = mask_arr.T
-        if mask_arr.shape != frame.shape[:2]:
-            mask_arr = cv2.resize(
-                mask_arr.astype(np.uint8),
-                (frame.shape[1], frame.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
-        overlays.append(overlay_union(frame, mask_arr, alpha=0.5))
-    write_video_mp4(output_path, overlays, fps)
-    return str(output_path)
-
-
-def _init_predictor(weight_name: str, *, device: str = "cuda", image_size: Optional[int] = None, compile_image_encoder: bool = False) -> object:
-    """Build an EdgeTAM video predictor using discovered config/weights.
-
-    Honors the optional image_size to reduce memory footprint in a device-agnostic way.
-    """
-    if build_sam2_video_predictor is None:
-        raise ImportError("EdgeTAM is not installed")
-
-    config_candidates = [
-        ("configs/edgetam.yaml", "./EdgeTAM/sam2/configs/edgetam.yaml"),
-    ]
-    checkpoint_candidates = [
-        "./EdgeTAM/checkpoints/edgetam.pt",
-        weight_name,
-    ]
-
-    config_name: Optional[str] = None
-    for hydra_name, disk_path in config_candidates:
-        resolved = Path(expand_path(disk_path))
-        if resolved.exists():
-            config_name = hydra_name
-            break
-
-    checkpoint_path = _find_existing(checkpoint_candidates)
-
-    if config_name is None:
-        raise FileNotFoundError(f"EdgeTAM config not found among: {[p for _, p in config_candidates]}")
-    if checkpoint_path is None:
-        raise FileNotFoundError(f"EdgeTAM checkpoint not found among: {checkpoint_candidates}")
-
-    hydra_overrides_extra = []
-    if image_size is not None:
-        # EdgeTAM config assumes image_size divisible by 64 (e.g., 1024 -> grids 64,16).
-        safe_imgsz = max(64, int(round(int(image_size) / 64) * 64))
-        if safe_imgsz != int(image_size):
-            print(f"[WARN EdgeTAM] Adjusting image_size from {image_size} to nearest multiple-of-64: {safe_imgsz}")
-        
-        # Override image_size and corresponding RoPE attention sizes
-        # feat_sizes for self-attention: stride-32 features = image_size / 32
-        # q_sizes for cross-attention: stride-16 features = image_size / 16
-        # k_sizes for cross-attention: stride-64 features = image_size / 64
-        feat_size = safe_imgsz // 32
-        q_size = safe_imgsz // 16
-        k_size = safe_imgsz // 64
-        
-        hydra_overrides_extra.extend([
-            f"++model.image_size={safe_imgsz}",
-            f"++model.memory_attention.layer.self_attention.feat_sizes=[{feat_size},{feat_size}]",
-            f"++model.memory_attention.layer.cross_attention.q_sizes=[{q_size},{q_size}]",
-            f"++model.memory_attention.layer.cross_attention.k_sizes=[{k_size},{k_size}]",
-        ])
-    
-    # Optionally compile image encoder for speed (adds compile overhead on first run)
-    if compile_image_encoder:
-        hydra_overrides_extra.append("++model.compile_image_encoder=true")
-
-    return build_sam2_video_predictor(
-        config_file=config_name,
-        ckpt_path=str(checkpoint_path),
-        device=device,
-        hydra_overrides_extra=hydra_overrides_extra,
-    )
-
-
-def _maybe_compile_edgetam_predictor(
-    predictor,
-    *,
-    compile_model: bool,
-    compile_mode: str | None,
-    compile_backend: str | None,
-) -> None:
-    """Note: EdgeTAM does not support full model compilation via torch.compile.
-    
-    Only the image encoder can be compiled via compile_image_encoder=True in the config.
-    Attempting to compile the full predictor (which has @torch.inference_mode() decorators)
-    will likely fail or provide no benefit.
-    
-    SAM 2 has vos_optimized=True flag for full compilation, but EdgeTAM doesn't support this.
-    """
-    if not compile_model:
-        return
-    
-    print("[WARN EdgeTAM] Full model compilation via --compile_models is not supported by EdgeTAM.")
-    print("[WARN EdgeTAM] Only image encoder compilation is supported (already enabled if --compile_models is set).")
-    print("[WARN EdgeTAM] Methods decorated with @torch.inference_mode() cannot be compiled.")
-
-
-def _verify_predictor_interfaces(predictor: object) -> None:
-    """Ensure the required SAM2 video APIs are available."""
-    required = ("init_state", "add_new_points_or_box", "propagate_in_video")
-    missing = [name for name in required if not hasattr(predictor, name)]
-    if missing:
-        raise AttributeError(
-            "EdgeTAM/SAM2 build is missing video tracking APIs: "
-            + ", ".join(missing)
-            + ". Update the dependency to a version that exposes video propagation."
-        )
-
-
-def _run_points(
-    frames_24fps: List[Path],
-    prompt_frame_idx: int,
-    prompt_mask: np.ndarray,
-    imgsz: int,
-    weight_name: str,
-    device: str,
-    out_dir: Optional[Path] = None,
-    overlay_name: Optional[str] = None,
-    clip_fps: float = 24.0,
-    num_points: int = 5,
-    *,
-    compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
-    max_frames_in_mem: int = 600,  # NEW: limit number of frames in memory
-) -> Dict[str, object]:
-    _ = ()
-    # Translate the mask into positive point prompts.
-    # Use a single positive point for fair comparison with SAM2 point prompting.
-    points, labels = extract_points_from_mask(prompt_mask, 1)
-    if not points:
-        return {
-            "secs": None,
-            "fps": None,
-            "latency_ms": None,
-            "gpu_peak_alloc": None,
-            "gpu_peak_reserved": None,
-            "cpu_peak_rss": None,
-            "masks_seq": None,
-            "overlay": None,
-            "frames": len(frames_24fps),
-            "H": prompt_mask.shape[0],
-            "W": prompt_mask.shape[1],
-            "num_points": 0,
-        }
-
-    # Fairness alignment with SAM2: start GPU peak tracking BEFORE predictor build
-    # and separate setup (predictor build + clip write + init_state + prompt seeding)
-    # from pure propagation inference time.
-    process = psutil.Process()
-    reset_gpu_peaks()
-    cpu_peak = process.memory_info().rss
-    setup_start = time.perf_counter()
-
-    predictor = _init_predictor(weight_name, device=device, image_size=imgsz, compile_image_encoder=compile_model)
-    _verify_predictor_interfaces(predictor)
-    _maybe_compile_edgetam_predictor(
-        predictor,
-        compile_model=compile_model,
-        compile_mode=compile_mode,
-        compile_backend=compile_backend,
-    )
-    model_imgsz = getattr(predictor, "image_size", None)
-    print(f"[DEBUG EdgeTAM] predictor constructed & compiled (image_size={model_imgsz}, device={device})")
-    _gpu_debug_snapshot("post-predictor-build")
-
-    # Focus only on frames from the prompting timestep forward.
-    sub_frame_paths = frames_24fps[prompt_frame_idx:]
-    first_frame = _read_frame(sub_frame_paths[0])
-    height, width = first_frame.shape[:2]
-
-    # Write frames to a temporary JPEG directory instead of MP4 (avoids NVENC/NvMap allocs)
-    temp_dir = Path(out_dir) / f"__tmp_edgetam_points_{overlay_name or 'clip'}_frames" if out_dir else Path("__tmp_edgetam_points_frames")
-    try:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        for idx, frame_path in enumerate(sub_frame_paths):
-            frame = _read_frame(frame_path)
-            cv2.imwrite(str(temp_dir / f"{idx:05d}.jpg"), frame)
-        print(f"[DEBUG EdgeTAM] prepared temp frames at {temp_dir} with {len(sub_frame_paths)} images")
-        _gpu_debug_snapshot("after-temp-frames")
-    except Exception as e:
-        raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
-
-    inference_start: float | None = None
-    sub_masks_list: List[Optional[np.ndarray]]
-
-    # Separate try/except to pinpoint init_state failures
-    try:
-        # Keep frames and state on CPU to reduce upfront GPU allocations; load frames lazily
-        print(f"[DEBUG EdgeTAM] entering init_state(...) with CPU offloading & async frames")
-        print(f"[DEBUG EdgeTAM] predictor.image_size = {predictor.image_size}, imgsz arg = {imgsz}")
-        _gpu_debug_snapshot("pre-init_state")
-        inference_state = predictor.init_state(
-            str(temp_dir),
-            offload_video_to_cpu=True,
-            offload_state_to_cpu=True,
-            # Match example notebook behavior to avoid races and ensure deterministic shapes
-            async_loading_frames=False,
-        )
-        print("[DEBUG EdgeTAM] init_state completed")
-        _gpu_debug_snapshot("post-init_state")
-    except Exception as e:
-        print(f"[ERROR EdgeTAM] init_state failed: {e}")
-        # Attempt a debug load to inspect frame tensor shapes
-        try:
-            from EdgeTAM.sam2.utils.misc import load_video_frames as _sam2_load_frames  # type: ignore
-            imgs, vH, vW = _sam2_load_frames(
-                video_path=str(temp_dir),
-                image_size=model_imgsz or imgsz,
-                offload_video_to_cpu=True,
-                async_loading_frames=True,
-                compute_device=None if (torch is None or not torch.cuda.is_available()) else torch.device(device),
-            )
-            # Try to inspect first image shape
-            try:
-                first = imgs[0]
-                print(f"[DEBUG EdgeTAM] debug-load: first_frame_shape={getattr(first, 'shape', None)} video(HxW)={vH}x{vW}")
-            except Exception:
-                print(f"[DEBUG EdgeTAM] debug-load: images_type={type(imgs)} video(HxW)={vH}x{vW}")
-        except Exception as e2:
-            print(f"[DEBUG EdgeTAM] secondary debug load failed: {e2}")
-        raise
-
-    try:
-        points_np = np.array(points, dtype=np.float32)
-        labels_np = np.array(labels, dtype=np.int32)
-        predictor.add_new_points_or_box(
-            inference_state=inference_state, frame_idx=0, obj_id=1, points=points_np, labels=labels_np
-        )
-        print("[DEBUG EdgeTAM] prompt seeded (points)")
-        _gpu_debug_snapshot("post-add-prompt")
-        # Start pure inference timing AFTER seeding (parity with SAM2 logic)
-        inference_start = time.perf_counter()
-
-        # Replace sub_masks with a dict for sliding window
-        sub_masks: Dict[int, Optional[np.ndarray]] = {}
-        mask_indices: List[int] = []
-        mask_logits_count = 0
-        positive_logits_count = 0
-        print("[DEBUG EdgeTAM] starting propagate_in_video()")
-        _gpu_debug_snapshot("pre-propagate")
-        for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
-            try:
-                if mask_logits is None or 1 not in obj_ids:
-                    continue
-                if frame_idx == 0:
-                    print("[DEBUG EdgeTAM] first propagate yield received")
-                    _gpu_debug_snapshot("first-yield")
-                mask_logits_count += 1
-                if isinstance(mask_logits, (list, tuple)):
-                    idx = obj_ids.index(1)
-                    logits = mask_logits[idx]
-                else:
-                    logits = mask_logits
-                if logits is None:
-                    continue
-                if hasattr(logits, "numel") and logits.numel() == 0:  # type: ignore[attr-defined]
-                    continue
-                if hasattr(logits, "detach"):
-                    logits_np = logits.detach().cpu().numpy()
-                elif hasattr(logits, "cpu"):
-                    logits_np = logits.cpu().numpy()
-                else:
-                    logits_np = np.asarray(logits)
-                if logits_np.size == 0:
                     continue
                 if mask_logits_count <= 5:
                     print(
@@ -479,8 +144,8 @@ def _run_bbox(
     clip_fps: float = 24.0,
     *,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     max_frames_in_mem: int = 3,  # NEW: limit number of frames in memory
 ) -> Dict[str, object]:
     _ = (imgsz, device)
@@ -531,7 +196,7 @@ def _run_bbox(
     except Exception as e:
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
 
     try:
         # Keep frames and state on CPU to reduce upfront GPU allocations; load frames lazily
@@ -657,9 +322,9 @@ class EdgeTAM(Model):
         clip_fps: float = 24.0,
         num_points: int = 5,
         *,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
@@ -689,9 +354,9 @@ class EdgeTAM(Model):
         overlay_name: Optional[str] = None,
         clip_fps: float = 24.0,
         *,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_bbox(
             frames_24fps,
@@ -711,44 +376,6 @@ class EdgeTAM(Model):
 
 EDGETAM_MODEL = EdgeTAM()
 EDGETAM_RUNNERS = EDGETAM_MODEL.register()
-"""Runners for EdgeTAM variants."""
-
-from __future__ import annotations
-
-import os
-import shutil
-import sys
-import time
-import traceback
-from contextlib import nullcontext
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import cv2  # type: ignore[import]
-import numpy as np
-import psutil
-try:
-    import torch  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-
-try:
-    from EdgeTAM.sam2.build_sam import build_sam2_video_predictor  # type: ignore[import]
-except Exception:  # pragma: no cover - EdgeTAM optional
-    build_sam2_video_predictor = None  # type: ignore
-
-from ..prompts import extract_bbox_from_mask, extract_points_from_mask
-from .base import Model
-from ..utils import cleanup_after_run, cuda_sync, expand_path, get_gpu_peaks, maybe_compile_module, reset_gpu_peaks
-from ..video_ops import overlay_video_frames, prepare_frame_stream
-
-
-DEBUG_LOGS = os.getenv("SAV_BENCH_DEBUG", "").lower() in {"1", "true", "yes", "on"}
-
-
-def _log_debug(message: str) -> None:
-    if DEBUG_LOGS:
-        print(message)
 
 
 def _safe_image_size(image_size: Optional[int]) -> Optional[int]:
@@ -886,8 +513,8 @@ def _maybe_compile_edgetam_predictor(
     predictor,
     *,
     compile_model: bool,
-    compile_mode: str | None,
-    compile_backend: str | None,
+    compile_mode: Optional[str],
+    compile_backend: Optional[str],
 ) -> None:
     """Note: EdgeTAM does not support full model compilation via torch.compile.
     
@@ -932,8 +559,8 @@ def _run_points(
     precision=None,
     max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     _attempt: int = 1,
 ) -> Dict[str, object]:
     _ = ()
@@ -1034,7 +661,7 @@ def _run_points(
     except Exception as e:
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
     sub_masks_list: List[Optional[np.ndarray]]
 
     # Separate try/except to pinpoint init_state failures
@@ -1272,8 +899,8 @@ def _run_bbox(
     precision=None,
     max_clip_frames: Optional[int] = None,
     compile_model: bool = False,
-    compile_mode: str | None = "reduce-overhead",
-    compile_backend: str | None = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     _attempt: int = 1,
 ) -> Dict[str, object]:
     _ = (imgsz, device)
@@ -1360,7 +987,7 @@ def _run_bbox(
     except Exception as e:
         raise RuntimeError(f"Failed to prepare temp JPEG frames at {temp_dir}: {e}")
 
-    inference_start: float | None = None
+    inference_start: Optional[float] = None
     bbox_np = np.array(bbox, dtype=np.float32)
 
     try:
@@ -1545,9 +1172,9 @@ class EdgeTAM(Model):
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_points(
             frames_24fps,
@@ -1581,9 +1208,9 @@ class EdgeTAM(Model):
         *,
         precision=None,
         max_clip_frames: Optional[int] = None,
-        compile_model: bool = False,
-        compile_mode: str | None = "reduce-overhead",
-        compile_backend: str | None = None,
+    compile_model: bool = False,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_backend: Optional[str] = None,
     ) -> Dict[str, object]:
         return _run_bbox(
             frames_24fps,
