@@ -18,11 +18,6 @@ def main() -> None:
     # annotation_stride_frames=4 to evaluate exactly those samples.
     experiments = [
         ExperimentConfig(
-            name="imgsz768_input24_anno6",
-            description="Baseline 768 inference at 24fps input, scoring every 6th frame",
-            overrides={"imgsz": 768, "input_frame_stride": 1, "annotation_stride_frames": 4},
-        ),
-        ExperimentConfig(
             name="imgsz768_input12_anno6",
             description="768 inference fed 12fps input (stride 2) with 6fps annotations",
             overrides={"imgsz": 768, "input_frame_stride": 2, "annotation_stride_frames": 4},
