@@ -63,7 +63,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Comma-separated list of model_prompt combinations",
     )
     parser.add_argument("--weights_dir", type=str, default=".", help="Directory containing weight files")
-    parser.add_argument("--imgsz", type=int, default=1024)
+    parser.add_argument("--imgsz", type=int, default=768, help="Square inference image size (default: 768)")
     parser.add_argument("--limit_videos", type=int, default=1, help="Limit number of videos (0 = all, default=1 for profiling)")
     parser.add_argument("--limit_objects", type=int, default=1, help="Limit number of objects per video (0 = all, default=1 for profiling)")
     parser.add_argument("--out_dir", type=str, default=None, help="Output directory for profiling results")
@@ -315,7 +315,21 @@ def run_profile(args: argparse.Namespace) -> Path:
     """Main profiling routine."""
     split_dir, out_dir = _prepare_dataset(args)
     weights_dir = Path(args.weights_dir)
-    model_tags = [tag.strip() for tag in args.models.split(",") if tag.strip()]
+    def _all_model_tags() -> List[str]:
+        tags: List[str] = []
+        for model_name in SAM2_WEIGHTS:
+            for prompt in ("points", "bbox"):
+                tags.append(f"{model_name}_{prompt}")
+        for model_name in EDGETAM_WEIGHTS:
+            for prompt in ("points", "bbox"):
+                tags.append(f"{model_name}_{prompt}")
+        return tags
+
+    # Allow convenience token 'all' (or empty) to expand to every known model tag.
+    if not getattr(args, "models", None) or str(args.models).strip().lower() in ("", "all"):
+        model_tags = _all_model_tags()
+    else:
+        model_tags = [tag.strip() for tag in args.models.split(",") if tag.strip()]
     models = _resolve_models(args, model_tags, weights_dir)
     if not models:
         raise SystemExit("No valid models selected")

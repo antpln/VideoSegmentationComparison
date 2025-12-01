@@ -12,6 +12,7 @@ OBJECTS=2
 RUNS=5
 WARMUP=2
 OUT_DIR=""
+IMGSZ=768
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -37,6 +38,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --warmup)
             WARMUP="$2"
+            shift 2
+            ;;
+        --imgsz)
+            IMGSZ="$2"
             shift 2
             ;;
         --out_dir)
@@ -147,6 +152,7 @@ Nsight: ${NSYS_CMD}
 Python: $(python3 --version)
 CUDA: $(python3 -c "import torch; print(torch.version.cuda if torch.cuda.is_available() else 'N/A')" 2>/dev/null || echo "N/A")
 GPU: $(python3 -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')" 2>/dev/null || echo "N/A")
+Image size: ${IMGSZ}
 EOF
 
 cat "${OUT_DIR}/experiment_config.txt"
@@ -167,6 +173,7 @@ NSYS_OUTPUT_DIR="${OUT_DIR}/nsight_reports" \
     --limit_objects "${OBJECTS}" \
     --warmup_runs "${WARMUP}" \
     --profile_runs "${RUNS}" \
+    --imgsz "${IMGSZ}" \
     --out_dir "${OUT_DIR}/profile_outputs"
 
 # End timer
