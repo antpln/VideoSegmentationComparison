@@ -139,6 +139,21 @@ class _FrameStream:
 		return self.target_hw
 
 
-def prepare_frame_stream(paths: Iterable[Path], imgsz: Optional[int] = None, target_hw: Optional[Tuple[int, int]] = None, force_square: bool = False) -> _FrameStream:
-	return _FrameStream(paths, imgsz=imgsz, target_hw=target_hw, force_square=force_square)
+def prepare_frame_stream(
+	paths: Iterable[Path],
+	imgsz: Optional[int] = None,
+	target_hw: Optional[Tuple[int, int]] = None,
+	force_square: bool = False,
+	start_idx: int = 0,
+) -> _FrameStream:
+	"""Create a _FrameStream for the given paths.
+
+	start_idx allows callers to request a stream beginning at an offset into the
+	provided paths (used by runners that need a prompt-aligned stream).
+	"""
+	paths_list = list(paths)
+	# Clamp start_idx to valid range
+	if start_idx < 0:
+		start_idx = 0
+	return _FrameStream(paths_list[start_idx:], imgsz=imgsz, target_hw=target_hw, force_square=force_square)
 
