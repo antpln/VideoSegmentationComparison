@@ -74,12 +74,14 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--input_frame_stride",
+        "--input-frame-stride",
         type=int,
         default=1,
         help="Only feed every Nth frame to the models (1 = use every frame)",
     )
     parser.add_argument(
         "--annotation_stride_frames",
+        "--annotation-stride-frames",
         type=int,
         default=0,
         help="Only score annotations spaced by this many video frames (0 = use every annotation)",
