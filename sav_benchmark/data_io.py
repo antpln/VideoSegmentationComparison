@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2  # type: ignore[import]
 import numpy as np
@@ -29,7 +29,7 @@ def list_frames_24fps(split_dir: Path, video_id: str) -> List[Path]:
     return sorted(frame_dir.glob("*.jpg"))
 
 
-def parse_idx(stem: str) -> int | None:
+def parse_idx(stem: str) -> Optional[int]:
     """Parse a filename stem into an integer frame index when possible."""
     try:
         return int(stem)
@@ -56,7 +56,7 @@ def list_annotated_indices_6fps(split_dir: Path, video_id: str) -> Dict[str, Lis
     return out
 
 
-def load_mask_png(path: Path) -> np.ndarray | None:
+def load_mask_png(path: Path) -> Optional[np.ndarray]:
     """Return a boolean mask loaded from a PNG file."""
     mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if mask is None:

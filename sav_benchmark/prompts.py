@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 
-def mask_centroid(binary_mask: np.ndarray) -> List[int] | None:
+def mask_centroid(binary_mask: np.ndarray) -> Optional[List[int]]:
     """Return the integer centroid of the foreground mask when present."""
     ys, xs = np.where(binary_mask > 0)
     if len(xs) == 0:
@@ -65,7 +65,7 @@ def extract_points_from_mask(binary_mask: np.ndarray, num_points: int = 5) -> Tu
     return points, labels
 
 
-def extract_bbox_from_mask(binary_mask: np.ndarray) -> List[int] | None:
+def extract_bbox_from_mask(binary_mask: np.ndarray) -> Optional[List[int]]:
     """Compute the tight axis-aligned bounding box for the mask."""
     if binary_mask is None or not np.any(binary_mask):
         return None
