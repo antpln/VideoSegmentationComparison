@@ -253,28 +253,11 @@ def _get_gpu_memory_gb() -> float:
 
 
 def _auto_configure_for_device(args: argparse.Namespace) -> None:
-    """Auto-configure memory-friendly defaults for constrained devices."""
-    if torch is None or not torch.cuda.is_available():
-        return
+    """Reserved for future auto-configuration if needed.
     
-    is_jetson = _is_jetson_device()
-    gpu_mem_gb = _get_gpu_memory_gb()
-    
-    if is_jetson or gpu_mem_gb < 12:
-        # Memory-constrained device: set conservative defaults if not already specified
-        if args.max_clip_frames is None:
-            # Limit frames to reduce memory for init_state
-            args.max_clip_frames = 150 if gpu_mem_gb >= 8 else 100
-            print(f"[AUTO] Setting max_clip_frames={args.max_clip_frames} for {gpu_mem_gb:.1f}GB GPU")
-        
-        if args.imgsz > 512 and gpu_mem_gb < 8:
-            old_imgsz = args.imgsz
-            args.imgsz = 512
-            print(f"[AUTO] Reducing imgsz from {old_imgsz} to {args.imgsz} for {gpu_mem_gb:.1f}GB GPU")
-        elif args.imgsz > 768 and gpu_mem_gb < 12:
-            old_imgsz = args.imgsz
-            args.imgsz = 768
-            print(f"[AUTO] Reducing imgsz from {old_imgsz} to {args.imgsz} for {gpu_mem_gb:.1f}GB GPU")
+    Currently does nothing - experiment parameters (imgsz=768, etc.) are fixed.
+    """
+    pass
 
 
 def _clear_gpu_cache() -> None:
