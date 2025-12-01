@@ -11,6 +11,7 @@ VIDEOS=3
 OBJECTS=2
 RUNS=5
 WARMUP=2
+OUT_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --warmup)
             WARMUP="$2"
+            shift 2
+            ;;
+        --out_dir)
+            OUT_DIR="$2"
             shift 2
             ;;
         *)
@@ -88,8 +93,9 @@ if [ ! -d "${SPLIT_DIR}" ]; then
     exit 1
 fi
 
-if [ ! -d "${SPLIT_DIR}/JPEGImages_24fps" ]; then
-    echo "ERROR: Missing JPEGImages_24fps in ${SPLIT_DIR}"
+# Accept either extracted JPEG frames or video_fps_24/videos_fps_24 layouts
+if [ ! -d "${SPLIT_DIR}/JPEGImages_24fps" ] && [ ! -d "${SPLIT_DIR}/video_fps_24" ] && [ ! -d "${SPLIT_DIR}/videos_fps_24" ]; then
+    echo "ERROR: Missing frame source under ${SPLIT_DIR}. Expected JPEGImages_24fps or video_fps_24/videos_fps_24"
     exit 1
 fi
 
@@ -100,7 +106,12 @@ fi
 
 # Create output directory with timestamp and platform
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUT_DIR="${SPLIT_DIR}/nsight_experiment_${PLATFORM}_${TIMESTAMP}"
+# If an explicit out dir was provided, use it; otherwise create under split_dir
+if [ -n "${OUT_DIR}" ]; then
+    OUT_DIR="${OUT_DIR}/nsight_experiment_${PLATFORM}_${TIMESTAMP}"
+else
+    OUT_DIR="${SPLIT_DIR}/nsight_experiment_${PLATFORM}_${TIMESTAMP}"
+fi
 mkdir -p "${OUT_DIR}"
 
 echo "=========================================="

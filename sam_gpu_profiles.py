@@ -235,8 +235,13 @@ def _prepare_dataset(args: argparse.Namespace) -> Tuple[Path, Path]:
         if not args.split_dir:
             raise SystemExit("--split_dir is required unless --test_mode is used")
         split_dir = Path(args.split_dir)
-        if not (split_dir / "JPEGImages_24fps").exists():
-            raise FileNotFoundError("Missing JPEGImages_24fps directory")
+        # Accept either extracted JPEG frames or recorded videos (video_fps_24 / videos_fps_24)
+        has_jpeg = (split_dir / "JPEGImages_24fps").exists()
+        has_video24 = any((split_dir / d).exists() for d in ("video_fps_24", "videos_fps_24"))
+        if not (has_jpeg or has_video24):
+            raise FileNotFoundError(
+                "Missing frame sources: expected JPEGImages_24fps or video_fps_24/videos_fps_24 under split_dir"
+            )
         if not (split_dir / "Annotations_6fps").exists():
             raise FileNotFoundError("Missing Annotations_6fps directory")
         out_dir = Path(args.out_dir) if args.out_dir else split_dir / "profile_outputs"
